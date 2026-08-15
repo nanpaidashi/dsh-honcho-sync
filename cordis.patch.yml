@@ -4,7 +4,7 @@
 # Auto-syncs conversation turns and provides memory tools (recall/search/remember).
 #
 # Environment variables:
-#   HONCHO_URL     - Honcho API base URL (default: http://192.168.0.4:8000)
+#   HONCHO_URL     - Honcho API base URL (required)
 #   HONCHO_WORKSPACE - Workspace name (default: hermes)
 #
 # Installation:
@@ -17,9 +17,9 @@
       name: '@nanpaidashi/dsh-honcho-sync'
       config:
         honchoUrl: __FROM_ENV__
-        workspace: __FROM_ENV__
-        userPeer: shifu
-        agentPeer: spenpa
+        workspace: hermes
+        userPeer: user
+        agentPeer: agent
         debounceMs: 3000
         autoRecall: true
         recallBudget: 2000

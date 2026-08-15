@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **Give your DeepSeek Harness AI persistent memory.**
-> Auto-sync every conversation turn to Honcho, and give the AI built-in tools to recall, search, and remember across sessions.
+> Auto-sync every conversation turn to a self-hosted Honcho service, and give the AI built-in tools to recall, search, and remember across sessions.
 
 ---
 
@@ -12,7 +12,7 @@
 
 ### 这是什么？
 
-让 DeepSeek Harness (DSH) AI 拥有**持久记忆**的完整集成方案。安装后 DSH 自动同步所有对话到 NAS 上的 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务，AI 可以直接调用记忆工具。
+**DeepSeek Harness 连接 Honcho 记忆的插件。** 安装后 DSH 自动同步所有对话到本地或云端部署的 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务，AI 可以直接调用记忆工具进行检索和保存。
 
 ### 功能清单
 
@@ -25,12 +25,11 @@
 | **honcho_context** | 读取当前 session 的完整对话上下文 |
 | **honcho_status** | 检查 Honcho 服务器健康状态和统计信息 |
 | **上下文注入** | 会话启动时自动从 Honcho 加载近期上下文 |
-| **Peer 管理** | 支持自定义用户/Agent 标识（peer_id） |
 | **去重** | 同一 session 不重复推送相同内容 |
 
 ### 安装
 
-**前提：** 需要先部署 Honcho 记忆服务（NAS 或服务器）
+**前提：** 需要先部署 Honcho 记忆服务（NAS、服务器或云端）
 
 ```bash
 # 方式 1：从 GitHub 直接安装（推荐）
@@ -42,30 +41,35 @@ dsh plugin --profile web add @nanpaidashi/dsh-honcho-sync@latest
 
 ### 配置
 
-通过环境变量或 cordis 配置：
+部署 Honcho 后，通过环境变量配置 Honcho 地址：
+
+```bash
+export HONCHO_URL="http://your-honcho-server:8000"
+```
+
+或在 `~/.dsh/profiles/web/cordis.patch.yml` 中追加：
 
 ```yaml
-# ~/.dsh/profiles/web/cordis.patch.yml 中追加
 - id: honcho-sync
   config:
-    honchoUrl: "http://your-honcho-server:8000"
-    workspace: "hermes"
-    userPeer: "shifu"
-    agentPeer: "spenpa"
-    debounceMs: 3000
-    autoRecall: true
-    recallBudget: 2000
+    honchoUrl: "http://your-honcho-server:8000"   # Honcho API 地址（必填）
+    workspace: "hermes"                            # Workspace 名称
+    userPeer: "user"                               # 用户标识
+    agentPeer: "agent"                             # Agent 标识
+    debounceMs: 3000                               # 同步防抖延迟（毫秒）
+    autoRecall: true                               # 会话启动时自动 recall
+    recallBudget: 2000                             # recall 的 token 上限
 ```
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `HONCHO_URL` | `http://192.168.0.4:8000` | Honcho API 地址 |
-| `HONCHO_WORKSPACE` | `hermes` | Workspace 名称 |
-| `HONCHO_USER_PEER` | `shifu` | 用户标识 |
-| `HONCHO_AGENT_PEER` | `spenpa` | Agent 标识 |
-| `HONCHO_DEBOUNCE_MS` | `3000` | 同步防抖延迟 |
+| 变量 | 默认值 | 必填 | 说明 |
+|------|--------|------|------|
+| `HONCHO_URL` | — | **是** | Honcho API 地址，如 `http://192.168.0.4:8000` |
+| `HONCHO_WORKSPACE` | `hermes` | 否 | Workspace 名称 |
+| `HONCHO_USER_PEER` | `user` | 否 | 用户标识 |
+| `HONCHO_AGENT_PEER` | `agent` | 否 | Agent 标识 |
+| `HONCHO_DEBOUNCE_MS` | `3000` | 否 | 同步防抖延迟（毫秒） |
 
 ### 架构
 
@@ -94,7 +98,7 @@ MIT
 
 ### What is this?
 
-A complete integration between [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) and [Honcho](https://github.com/plastic-labs/honcho), a self-hosted long-term memory service. After installation, DSH auto-syncs every conversation turn to Honcho, and the AI gets built-in tools to recall, search, and remember across sessions.
+**A plugin connecting DeepSeek Harness to Honcho memory service.** After installation, DSH auto-syncs every conversation turn to a self-hosted [Honcho](https://github.com/plastic-labs/honcho) service, and the AI gets built-in tools to recall, search, and remember across sessions.
 
 ### Features
 
@@ -107,12 +111,11 @@ A complete integration between [DeepSeek Harness](https://github.com/deepseek-ai
 | **honcho_context** | Get full conversation context for the current session from Honcho. |
 | **honcho_status** | Check Honcho server health and statistics. |
 | **Context injection** | Auto-load recent context from Honcho on session start. |
-| **Peer management** | Configurable user/agent identifiers (peer_id). |
 | **Deduplication** | Same content in same session won't be pushed twice. |
 
 ### Installation
 
-**Prerequisite:** Deploy Honcho memory service first (on NAS or server)
+**Prerequisite:** Deploy Honcho memory service first (on NAS, server, or cloud)
 
 ```bash
 # Option 1: Install directly from GitHub (recommended)
@@ -124,30 +127,35 @@ dsh plugin --profile web add @nanpaidashi/dsh-honcho-sync@latest
 
 ### Configuration
 
-Via environment variables or cordis config:
+After deploying Honcho, configure the address via environment variables:
+
+```bash
+export HONCHO_URL="http://your-honcho-server:8000"
+```
+
+Or add to `~/.dsh/profiles/web/cordis.patch.yml`:
 
 ```yaml
-# Add to ~/.dsh/profiles/web/cordis.patch.yml
 - id: honcho-sync
   config:
-    honchoUrl: "http://your-honcho-server:8000"
-    workspace: "hermes"
-    userPeer: "shifu"
-    agentPeer: "spenpa"
-    debounceMs: 3000
-    autoRecall: true
-    recallBudget: 2000
+    honchoUrl: "http://your-honcho-server:8000"   # Honcho API URL (required)
+    workspace: "hermes"                            # Workspace name
+    userPeer: "user"                               # User identifier
+    agentPeer: "agent"                             # Agent identifier
+    debounceMs: 3000                               # Sync debounce delay (ms)
+    autoRecall: true                               # Auto-recall on session start
+    recallBudget: 2000                             # Token budget for recall
 ```
 
 Environment variables:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HONCHO_URL` | `http://192.168.0.4:8000` | Honcho API base URL |
-| `HONCHO_WORKSPACE` | `hermes` | Workspace name |
-| `HONCHO_USER_PEER` | `shifu` | User peer_id |
-| `HONCHO_AGENT_PEER` | `spenpa` | Agent peer_id |
-| `HONCHO_DEBOUNCE_MS` | `3000` | Sync debounce delay |
+| Variable | Default | Required | Description |
+|----------|---------|----------|-------------|
+| `HONCHO_URL` | — | **Yes** | Honcho API base URL, e.g. `http://192.168.0.4:8000` |
+| `HONCHO_WORKSPACE` | `hermes` | No | Workspace name |
+| `HONCHO_USER_PEER` | `user` | No | User peer_id |
+| `HONCHO_AGENT_PEER` | `agent` | No | Agent peer_id |
+| `HONCHO_DEBOUNCE_MS` | `3000` | No | Sync debounce delay (ms) |
 
 ### Architecture
 

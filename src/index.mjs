@@ -1,27 +1,20 @@
 /**
- * @spenpa/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness
+ * @nanpaidashi/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness
  *
- * A complete integration between DSH and Honcho, a long-term memory service.
- * Provides tools for recall, search, remember, context injection, and auto-sync.
- *
- * Features:
- * - Auto-sync every conversation turn to Honcho (debounced)
- * - Memory tools: honcho_recall, honcho_search, honcho_remember, honcho_status
- * - System prompt guidance section teaching AI how to use Honcho
- * - Peer card management (user profile, agent profile)
- * - Context injection on session start
- * - Configurable via env vars or cordis config
+ * Give DSH persistent memory: auto-sync every conversation turn to a
+ * self-hosted Honcho service, and equip the AI with tools to recall,
+ * search, remember, and inject context.
  *
  * Installation:
- *   dsh plugin --profile web add @spenpa/dsh-honcho-sync@latest
+ *   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
  *
  * Environment variables:
- *   HONCHO_URL     - Honcho API base URL (default: http://192.168.0.4:8000)
+ *   HONCHO_URL     - Honcho API base URL (required, e.g. http://192.168.0.4:8000)
  *   HONCHO_WORKSPACE - Workspace name (default: hermes)
- *   HONCHO_USER_PEER - User peer_id (default: shifu)
- *   HONCHO_AGENT_PEER - Agent peer_id (default: spenpa)
+ *   HONCHO_USER_PEER - User peer_id (default: user)
+ *   HONCHO_AGENT_PEER - Agent peer_id (default: agent)
  *
- * @module @spenpa/dsh-honcho-sync
+ * @module @nanpaidashi/dsh-honcho-sync
  */
 
 const name = 'honcho-sync';
@@ -29,10 +22,10 @@ const inject = [];
 
 function getConfig(config) {
   return {
-    honchoUrl: (config?.honchoUrl || process.env.HONCHO_URL || 'http://192.168.0.4:8000').replace(/\/$/, ''),
+    honchoUrl: (config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, ''),
     workspace: config?.workspace || process.env.HONCHO_WORKSPACE || 'hermes',
-    userPeer: config?.userPeer || process.env.HONCHO_USER_PEER || 'shifu',
-    agentPeer: config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'spenpa',
+    userPeer: config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
+    agentPeer: config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
     debounceMs: config?.debounceMs ?? 3000,
     autoRecall: config?.autoRecall ?? true,
     recallBudget: config?.recallBudget ?? 2000,
@@ -86,7 +79,7 @@ function apply(ctx, config) {
   function defineHonchoRecall() {
     return {
       name: 'honcho_recall',
-      description: `Search Honcho memory service for relevant conversation context from past sessions. Call at the start of a session or before important tasks. Returns conversation snippets from your long-term memory.`,
+      description: `Search your Honcho memory service for relevant conversation context from past sessions. Call at the start of a session or before important tasks to recall what matters.`,
       parameters: {
         query: { type: 'string', required: true, description: 'Natural language query describing what to recall.' },
         max_tokens: { type: 'integer', description: `Token limit for results (default: ${cfg.recallBudget}).` },
@@ -110,7 +103,7 @@ function apply(ctx, config) {
   function defineHonchoSearch() {
     return {
       name: 'honcho_search',
-      description: `Search across ALL sessions in your Honcho memory workspace. Use for precise lookups beyond the current session.`,
+      description: `Search across ALL sessions in your Honcho workspace. Use for precise lookups beyond the current session.`,
       parameters: {
         query: { type: 'string', required: true, description: 'Search query.' },
         max_tokens: { type: 'integer', description: 'Token limit (default: 2000).' },
@@ -135,7 +128,7 @@ function apply(ctx, config) {
       description: `Save an important fact, decision, constraint, or preference to your long-term Honcho memory. Use when the user states something that should persist across sessions.`,
       parameters: {
         content: { type: 'string', required: true, description: 'The fact or information to remember.' },
-        peer_id: { type: 'string', description: `Who said it (${cfg.userPeer} or ${cfg.agentPeer}).` },
+        peer_id: { type: 'string', description: `Who said it (user or agent).` },
       },
       async execute(args) {
         const peer = args.peer_id || cfg.userPeer;
@@ -227,7 +220,7 @@ function apply(ctx, config) {
     });
   }
 
-  // ─── Auto-sync (existing logic) ───
+  // ─── Auto-sync ───
 
   async function postToHoncho(sessionId, messages) {
     try {
