@@ -31,7 +31,7 @@
 
 ### 安装
 
-**前提：** 已部署 Honcho 记忆服务（Docker 一行命令即可）
+**前提：** 已部署 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务（Docker 一行命令即可）
 
 ```bash
 # 方式 1：从 GitHub 直接安装（推荐）
@@ -138,7 +138,7 @@ MIT
 
 ### Installation
 
-**Prerequisite:** Deploy Honcho first (one Docker command)
+**Prerequisite:** Deploy [Honcho](https://github.com/plastic-labs/honcho) first (one Docker command)
 
 ```bash
 # Option 1: Install from GitHub (recommended)
