@@ -1,0 +1,48 @@
+{
+  "name": "@spenpa/dsh-honcho-sync",
+  "version": "0.1.0",
+  "description": "DSH plugin: auto-sync conversation turns to Honcho memory service on NAS",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "cp src/index.mjs dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "honcho",
+    "memory",
+    "cordis",
+    "plugin",
+    "long-term-memory"
+  ],
+  "license": "MIT",
+  "author": "spenpa",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZSeven-W/dsh-honcho-sync"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": false
+    }
+  },
+  "files": [
+    "dist/",
+    "cordis.patch.yml"
+  ]
+}

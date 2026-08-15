@@ -1,0 +1,20 @@
+# dsh-honcho-sync bundle patch
+#
+# 将 honcho-sync 插件注入到 DSH profile 层，自动同步会话到 NAS 上的 Honcho 记忆服务。
+#
+# 环境变量：
+#   HONCHO_URL     - Honcho API 地址（默认 http://192.168.0.4:8000）
+#   HONCHO_WORKSPACE - Honcho workspace 名称（默认 hermes）
+#
+# 安装后使用：
+#   dsh plugin --profile web add @spenpa/dsh-honcho-sync@latest
+#
+# 叠加顺序：dsh-base → 本 bundle patch → profile cordis.patch.yml → --patch
+
+- insert:
+    - id: honcho-sync
+      name: '@spenpa/dsh-honcho-sync'
+      config:
+        honchoUrl: __FROM_ENV__
+        workspace: __FROM_ENV__
+        debounceMs: 3000
