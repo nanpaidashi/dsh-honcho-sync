@@ -5,7 +5,7 @@
 #
 # Environment variables:
 #   HONCHO_URL     - Honcho API base URL (required)
-#   HONCHO_WORKSPACE - Workspace name (default: hermes)
+#   HONCHO_WORKSPACE - Workspace name (must be configured)
 #
 # Installation:
 #   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
@@ -17,7 +17,7 @@
       name: '@nanpaidashi/dsh-honcho-sync'
       config:
         honchoUrl: __FROM_ENV__
-        workspace: hermes
+        workspace: ''
         userPeer: user
         agentPeer: agent
         debounceMs: 3000

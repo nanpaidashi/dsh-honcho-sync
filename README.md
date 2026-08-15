@@ -12,7 +12,7 @@
 
 ### 这是什么？
 
-**DeepSeek Harness 连接 Honcho 记忆的插件。** 安装后 DSH 自动同步所有对话到本地或云端部署的 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务，AI 可以直接调用记忆工具进行检索和保存。
+**DeepSeek Harness (DSH) 连接 Honcho 记忆的插件。** 安装后 DSH 自动同步所有对话到用户自己部署的 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务（NAS、服务器或云端均可），AI 可以直接调用记忆工具进行检索和保存。
 
 ### 功能清单
 
@@ -29,7 +29,7 @@
 
 ### 安装
 
-**前提：** 需要先部署 Honcho 记忆服务（NAS、服务器或云端）
+**前提：** 需要先部署 Honcho 记忆服务（NAS、服务器或云端均可）
 
 ```bash
 # 方式 1：从 GitHub 直接安装（推荐）
@@ -53,9 +53,9 @@ export HONCHO_URL="http://your-honcho-server:8000"
 - id: honcho-sync
   config:
     honchoUrl: "http://your-honcho-server:8000"   # Honcho API 地址（必填）
-    workspace: "hermes"                            # Workspace 名称
-    userPeer: "user"                               # 用户标识
-    agentPeer: "agent"                             # Agent 标识
+    workspace: "your-workspace"                    # 你的 Workspace 名称
+    userPeer: "user"                               # 用户标识（可自定义）
+    agentPeer: "agent"                             # Agent 标识（可自定义）
     debounceMs: 3000                               # 同步防抖延迟（毫秒）
     autoRecall: true                               # 会话启动时自动 recall
     recallBudget: 2000                             # recall 的 token 上限
@@ -65,10 +65,10 @@ export HONCHO_URL="http://your-honcho-server:8000"
 
 | 变量 | 默认值 | 必填 | 说明 |
 |------|--------|------|------|
-| `HONCHO_URL` | — | **是** | Honcho API 地址，如 `http://192.168.0.4:8000` |
-| `HONCHO_WORKSPACE` | `hermes` | 否 | Workspace 名称 |
-| `HONCHO_USER_PEER` | `user` | 否 | 用户标识 |
-| `HONCHO_AGENT_PEER` | `agent` | 否 | Agent 标识 |
+| `HONCHO_URL` | — | **是** | Honcho API 地址，如 `http://localhost:8000` |
+| `HONCHO_WORKSPACE` | — | **是** | Workspace 名称 |
+| `HONCHO_USER_PEER` | `user` | 否 | 用户标识（可自定义） |
+| `HONCHO_AGENT_PEER` | `agent` | 否 | Agent 标识（可自定义） |
 | `HONCHO_DEBOUNCE_MS` | `3000` | 否 | 同步防抖延迟（毫秒） |
 
 ### 架构
@@ -98,7 +98,7 @@ MIT
 
 ### What is this?
 
-**A plugin connecting DeepSeek Harness to Honcho memory service.** After installation, DSH auto-syncs every conversation turn to a self-hosted [Honcho](https://github.com/plastic-labs/honcho) service, and the AI gets built-in tools to recall, search, and remember across sessions.
+**A plugin connecting DeepSeek Harness to Honcho memory service.** After installation, DSH auto-syncs every conversation turn to a self-hosted [Honcho](https://github.com/plastic-labs/honcho) service (NAS, server, or cloud), and the AI gets built-in tools to recall, search, and remember across sessions.
 
 ### Features
 
@@ -139,9 +139,9 @@ Or add to `~/.dsh/profiles/web/cordis.patch.yml`:
 - id: honcho-sync
   config:
     honchoUrl: "http://your-honcho-server:8000"   # Honcho API URL (required)
-    workspace: "hermes"                            # Workspace name
-    userPeer: "user"                               # User identifier
-    agentPeer: "agent"                             # Agent identifier
+    workspace: "your-workspace"                    # Your workspace name
+    userPeer: "user"                               # User identifier (customizable)
+    agentPeer: "agent"                             # Agent identifier (customizable)
     debounceMs: 3000                               # Sync debounce delay (ms)
     autoRecall: true                               # Auto-recall on session start
     recallBudget: 2000                             # Token budget for recall
@@ -151,10 +151,10 @@ Environment variables:
 
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
-| `HONCHO_URL` | — | **Yes** | Honcho API base URL, e.g. `http://192.168.0.4:8000` |
-| `HONCHO_WORKSPACE` | `hermes` | No | Workspace name |
-| `HONCHO_USER_PEER` | `user` | No | User peer_id |
-| `HONCHO_AGENT_PEER` | `agent` | No | Agent peer_id |
+| `HONCHO_URL` | — | **Yes** | Honcho API base URL, e.g. `http://localhost:8000` |
+| `HONCHO_WORKSPACE` | — | **Yes** | Workspace name |
+| `HONCHO_USER_PEER` | `user` | No | User peer_id (customizable) |
+| `HONCHO_AGENT_PEER` | `agent` | No | Agent peer_id (customizable) |
 | `HONCHO_DEBOUNCE_MS` | `3000` | No | Sync debounce delay (ms) |
 
 ### Architecture

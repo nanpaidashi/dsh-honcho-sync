@@ -9,8 +9,8 @@
  *   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
  *
  * Environment variables:
- *   HONCHO_URL     - Honcho API base URL (required, e.g. http://192.168.0.4:8000)
- *   HONCHO_WORKSPACE - Workspace name (default: hermes)
+ *   HONCHO_URL     - Honcho API base URL (required, e.g. http://localhost:8000)
+ *   HONCHO_WORKSPACE - Workspace name (no default; must be configured)
  *   HONCHO_USER_PEER - User peer_id (default: user)
  *   HONCHO_AGENT_PEER - Agent peer_id (default: agent)
  *
@@ -21,9 +21,14 @@ const name = 'honcho-sync';
 const inject = [];
 
 function getConfig(config) {
+  const url = (config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, '');
+  if (!url) {
+    console.error('[honcho-sync] HONCHO_URL is required. Set it via environment variable or cordis config.');
+    return null;
+  }
   return {
-    honchoUrl: (config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, ''),
-    workspace: config?.workspace || process.env.HONCHO_WORKSPACE || 'hermes',
+    honchoUrl: url,
+    workspace: config?.workspace || process.env.HONCHO_WORKSPACE || '',
     userPeer: config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
     agentPeer: config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
     debounceMs: config?.debounceMs ?? 3000,
@@ -38,6 +43,8 @@ function apply(ctx, config) {
   if (sessionQuery === undefined) return;
 
   const cfg = getConfig(config);
+  if (!cfg) return;
+
   const state = new Map();
 
   // ─── Honcho API helpers ───
@@ -82,7 +89,7 @@ function apply(ctx, config) {
       description: `Search your Honcho memory service for relevant conversation context from past sessions. Call at the start of a session or before important tasks to recall what matters.`,
       parameters: {
         query: { type: 'string', required: true, description: 'Natural language query describing what to recall.' },
-        max_tokens: { type: 'integer', description: `Token limit for results (default: ${cfg.recallBudget}).` },
+        max_tokens: { type: 'integer', description: 'Token limit for results (configurable via recallBudget).' },
         limit: { type: 'integer', description: 'Max results to return (default: 10).' },
       },
       async execute(args, exec) {
@@ -128,7 +135,7 @@ function apply(ctx, config) {
       description: `Save an important fact, decision, constraint, or preference to your long-term Honcho memory. Use when the user states something that should persist across sessions.`,
       parameters: {
         content: { type: 'string', required: true, description: 'The fact or information to remember.' },
-        peer_id: { type: 'string', description: `Who said it (user or agent).` },
+        peer_id: { type: 'string', description: 'Who said it (user or agent).' },
       },
       async execute(args) {
         const peer = args.peer_id || cfg.userPeer;
@@ -153,7 +160,7 @@ function apply(ctx, config) {
         return {
           ok: true,
           tool: 'honcho_status',
-          text: `Honcho: ${health?.status || 'unknown'} | Workspace: ${cfg.workspace} | URL: ${cfg.honchoUrl}`,
+          text: `Honcho: ${health?.status || 'unknown'} | Workspace: ${cfg.workspace || 'not set'} | URL: ${cfg.honchoUrl}`,
         };
       },
     };

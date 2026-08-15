@@ -1,7 +1,7 @@
 {
-  "name": "@spenpa/dsh-honcho-sync",
-  "version": "0.1.0",
-  "description": "DSH plugin: auto-sync conversation turns to Honcho memory service on NAS",
+  "name": "@nanpaidashi/dsh-honcho-sync",
+  "version": "0.3.0",
+  "description": "DSH plugin: auto-sync conversation turns to Honcho memory service on self-hosted NAS or cloud",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
@@ -23,10 +23,9 @@
     "long-term-memory"
   ],
   "license": "MIT",
-  "author": "spenpa",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ZSeven-W/dsh-honcho-sync"
+    "url": "https://github.com/nanpaidashi/dsh-honcho-sync"
   },
   "dsh": {
     "bundle": {
