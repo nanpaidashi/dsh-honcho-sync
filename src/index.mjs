@@ -5,6 +5,8 @@
  * self-hosted Honcho service, and equip the AI with tools to recall,
  * search, remember, and inject context.
  *
+ * A visual settings panel is available in DSH settings (click "Honcho Memory").
+ *
  * Installation:
  *   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
  *
@@ -20,21 +22,24 @@
 const name = 'honcho-sync';
 const inject = [];
 
-function getConfig(config) {
-  const url = (config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, '');
+// ─── Config helpers ───
+
+function getConfig(config, resolvedSettings) {
+  const url = (resolvedSettings?.honchoUrl || config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, '');
   if (!url) {
-    console.error('[honcho-sync] HONCHO_URL is required. Set it via environment variable or cordis config.');
+    console.error('[honcho-sync] HONCHO_URL is required. Set it via environment variable or the settings panel.');
     return null;
   }
   return {
     honchoUrl: url,
-    workspace: config?.workspace || process.env.HONCHO_WORKSPACE || '',
-    userPeer: config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
-    agentPeer: config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
-    debounceMs: config?.debounceMs ?? 3000,
-    autoRecall: config?.autoRecall ?? true,
-    recallBudget: config?.recallBudget ?? 2000,
-    contextInjection: config?.contextInjection ?? true,
+    workspace: resolvedSettings?.workspace || config?.workspace || process.env.HONCHO_WORKSPACE || '',
+    userPeer: resolvedSettings?.userPeer || config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
+    agentPeer: resolvedSettings?.agentPeer || config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
+    debounceMs: resolvedSettings?.debounceMs ?? config?.debounceMs ?? 3000,
+    autoRecall: resolvedSettings?.autoRecall ?? config?.autoRecall ?? true,
+    recallBudget: resolvedSettings?.recallBudget ?? config?.recallBudget ?? 2000,
+    autoSync: resolvedSettings?.autoSync ?? config?.autoSync ?? true,
+    messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? 25000,
   };
 }
 
@@ -42,7 +47,66 @@ function apply(ctx, config) {
   const sessionQuery = ctx.get('sessionQuery');
   if (sessionQuery === undefined) return;
 
-  const cfg = getConfig(config);
+  // ─── Settings namespace wiring ───
+
+  // Import settings module dynamically (it's a plain JS file).
+  // Since we can't use import() in plain .mjs for ESM-only deps,
+  // we inline the minimal settings logic here.
+
+  const HONCHO_NS = 'honcho-memory';
+  const DEFAULTS = {
+    honchoUrl: '',
+    workspace: '',
+    userPeer: 'user',
+    agentPeer: 'agent',
+    sessionStrategy: 'per-directory',
+    debounceMs: 3000,
+    autoRecall: true,
+    recallBudget: 2000,
+    autoSync: true,
+    messageMaxChars: 25000,
+  };
+
+  // Resolve config from entry + resolved settings
+  let resolvedSettings = { ...DEFAULTS, ...(config || {}) };
+  let configWriter = null;
+
+  // Optional settings wiring
+  ctx.inject(['settings'], (settingsCtx) => {
+    const scope = settingsCtx.settings.register(
+      HONCHO_NS,
+      {
+        type: 'object',
+        properties: {
+          honchoUrl: { type: 'string', default: '' },
+          workspace: { type: 'string', default: '' },
+          userPeer: { type: 'string', default: 'user' },
+          agentPeer: { type: 'string', default: 'agent' },
+          sessionStrategy: { type: 'string', default: 'per-directory' },
+          debounceMs: { type: 'integer', default: 3000 },
+          autoRecall: { type: 'boolean', default: true },
+          recallBudget: { type: 'integer', default: 2000 },
+          autoSync: { type: 'boolean', default: true },
+          messageMaxChars: { type: 'integer', default: 25000 },
+        },
+        required: [],
+      },
+      { base: config || {}, validate: (v) => {
+        if (v.debounceMs !== undefined && v.debounceMs < 100) throw new Error('debounce must be >= 100ms');
+        if (v.recallBudget !== undefined && v.recallBudget < 1) throw new Error('recall budget must be >= 1');
+      }}
+    );
+    configWriter = patch => scope.update(patch);
+    resolvedSettings = { ...DEFAULTS, ...config || {}, ...scope.get() };
+
+    const unwatch = scope.watch(() => {
+      resolvedSettings = { ...DEFAULTS, ...config || {}, ...scope.get() };
+    });
+    settingsCtx.effect(() => unwatch);
+  });
+
+  // Use resolved settings for the config
+  const cfg = getConfig(config, resolvedSettings);
   if (!cfg) return;
 
   const state = new Map();
@@ -200,9 +264,7 @@ function apply(ctx, config) {
     ctx.effect(
       () => {
         const toolsReg = ctx.get('tools');
-        if (toolsReg !== undefined) {
-          toolsReg.register(tool);
-        }
+        if (toolsReg !== undefined) toolsReg.register(tool);
       },
       'honcho-sync: ' + tool.name
     );
@@ -289,10 +351,10 @@ function apply(ctx, config) {
 
       const messages = [];
       if (userContent) {
-        messages.push({ role: 'user', content: userContent.slice(0, 25000), peer_id: cfg.userPeer });
+        messages.push({ role: 'user', content: userContent.slice(0, cfg.messageMaxChars), peer_id: cfg.userPeer });
       }
       if (assistantContent) {
-        messages.push({ role: 'assistant', content: assistantContent.slice(0, 25000), peer_id: cfg.agentPeer });
+        messages.push({ role: 'assistant', content: assistantContent.slice(0, cfg.messageMaxChars), peer_id: cfg.agentPeer });
       }
 
       if (messages.length === 0) return;
@@ -330,6 +392,100 @@ function apply(ctx, config) {
       }
       state.clear();
     };
+  });
+
+  // ─── Loopback status route for settings panel ───
+
+  const WRITABLE_FIELDS = new Set([
+    'honchoUrl', 'workspace', 'userPeer', 'agentPeer',
+    'debounceMs', 'autoRecall', 'recallBudget', 'autoSync',
+    'sessionStrategy', 'messageMaxChars',
+  ]);
+  const STATUS_ROUTE = '/_dsh/dsh-honcho-sync/status';
+
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = webCtx.webServer;
+    const resolveConfig = () => ({ ...DEFAULTS, ...config || {}, ...resolvedSettings });
+    const resolveWriter = () => configWriter;
+
+    function isLoopbackRequest(req) {
+      const addr = req.socket?.remoteAddress || '';
+      const norm = addr.toLowerCase().split('%', 1)[0];
+      if (norm === '::1') return true;
+      if (addr.startsWith('::ffff:')) {
+        const mapped = addr.slice(7);
+        const parts = mapped.split('.');
+        if (parts.length === 4 && parts[0] === '127') return true;
+      }
+      if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(norm)) return true;
+      return false;
+    }
+
+    function isJsonRequest(req) {
+      const ct = req.headers['content-type'];
+      return typeof ct === 'string' && /^application\/json(?:\s*;|$)/i.test(ct);
+    }
+
+    function sendJson(res, status, value) {
+      const body = JSON.stringify(value);
+      res.writeHead(status, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': Buffer.byteLength(body),
+        'cache-control': 'no-store',
+      });
+      res.end(body);
+    }
+
+    const disposer = webServer.register({
+      kind: 'exact',
+      path: STATUS_ROUTE,
+      handler: async (req, res) => {
+        if (!isLoopbackRequest(req)) {
+          return sendJson(res, 403, { ok: false, error: 'loopback-only' });
+        }
+        if (req.method === 'GET') {
+          try {
+            return sendJson(res, 200, {
+              ok: true,
+              writable: configWriter !== null,
+              config: resolveConfig(),
+            });
+          } catch (e) {
+            return sendJson(res, 500, { ok: false, error: e.message });
+          }
+        }
+        if (req.method === 'POST') {
+          if (!isJsonRequest(req)) {
+            return sendJson(res, 400, { ok: false, error: 'json required' });
+          }
+          let body = '';
+          req.on('data', chunk => { body += chunk; });
+          req.on('end', async () => {
+            if (!configWriter) {
+              return sendJson(res, 409, { ok: false, error: 'settings not writable' });
+            }
+            try {
+              const payload = JSON.parse(body);
+              const action = payload.action;
+              if (action === 'configure') {
+                const field = payload.field;
+                if (typeof field !== 'string' || !WRITABLE_FIELDS.has(field)) {
+                  return sendJson(res, 400, { ok: false, error: 'unknown field' });
+                }
+                await configWriter({ [field]: payload.value });
+                return sendJson(res, 200, { ok: true, writable: true, config: resolveConfig() });
+              }
+              return sendJson(res, 400, { ok: false, error: 'unknown action' });
+            } catch (e) {
+              return sendJson(res, 400, { ok: false, error: e.message });
+            }
+          });
+        }
+        return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+      },
+    });
+
+    ctx.effect(() => disposer, 'honcho-sync: status route');
   });
 
   console.log(`[honcho-sync] initialized: url=${cfg.honchoUrl}, workspace=${cfg.workspace}`);

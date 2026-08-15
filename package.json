@@ -1,16 +1,19 @@
 {
   "name": "@nanpaidashi/dsh-honcho-sync",
-  "version": "0.3.0",
-  "description": "DSH plugin: auto-sync conversation turns to Honcho memory service on self-hosted NAS or cloud",
+  "version": "0.4.0",
+  "description": "DSH plugin: auto-sync conversation turns to Honcho memory service on self-hosted NAS or cloud, with visual settings panel",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
     ".": {
       "import": "./dist/index.js"
+    },
+    "./client": {
+      "import": "./dist/client.js"
     }
   },
   "scripts": {
-    "build": "cp src/index.mjs dist/index.js",
+    "build": "cp src/index.mjs dist/index.js && cp src/client/index.js dist/client.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -20,7 +23,8 @@
     "memory",
     "cordis",
     "plugin",
-    "long-term-memory"
+    "long-term-memory",
+    "settings-panel"
   ],
   "license": "MIT",
   "repository": {
@@ -30,15 +34,27 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.0"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": {
-      "optional": false
-    }
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.0-rc.6",
+    "@deepseek-ai/schemastery": ">=3.0.0",
+    "@deepseek-ai/dsh-client-runtime": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-locale": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-settings": ">=0.1.0-rc.6",
+    "react": "^18.2.0"
   },
   "files": [
     "dist/",
