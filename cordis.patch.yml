@@ -1,20 +1,25 @@
 # dsh-honcho-sync bundle patch
 #
-# 将 honcho-sync 插件注入到 DSH profile 层，自动同步会话到 NAS 上的 Honcho 记忆服务。
+# Honcho memory plugin for DeepSeek Harness.
+# Auto-syncs conversation turns and provides memory tools (recall/search/remember).
 #
-# 环境变量：
-#   HONCHO_URL     - Honcho API 地址（默认 http://192.168.0.4:8000）
-#   HONCHO_WORKSPACE - Honcho workspace 名称（默认 hermes）
+# Environment variables:
+#   HONCHO_URL     - Honcho API base URL (default: http://192.168.0.4:8000)
+#   HONCHO_WORKSPACE - Workspace name (default: hermes)
 #
-# 安装后使用：
-#   dsh plugin --profile web add @spenpa/dsh-honcho-sync@latest
+# Installation:
+#   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
 #
-# 叠加顺序：dsh-base → 本 bundle patch → profile cordis.patch.yml → --patch
+# Overlay order: dsh-base → this bundle patch → profile cordis.patch.yml → --patch
 
 - insert:
     - id: honcho-sync
-      name: '@spenpa/dsh-honcho-sync'
+      name: '@nanpaidashi/dsh-honcho-sync'
       config:
         honchoUrl: __FROM_ENV__
         workspace: __FROM_ENV__
+        userPeer: shifu
+        agentPeer: spenpa
         debounceMs: 3000
+        autoRecall: true
+        recallBudget: 2000
