@@ -9,8 +9,10 @@
       "import": "./dist/index.js"
     },
     "./client": {
-      "import": "./dist/client.js"
-    }
+      "import": "./dist/client.js",
+      "default": "./dist/client.js"
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "cp src/index.mjs dist/index.js && cp src/client/index.js dist/client.js",
@@ -39,7 +41,6 @@
       "inject": [
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-ui-settings"
       ],
       "platform": "web"

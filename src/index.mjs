@@ -45,7 +45,6 @@ function getConfig(config, resolvedSettings) {
 
 function apply(ctx, config) {
   const sessionQuery = ctx.get('sessionQuery');
-  if (sessionQuery === undefined) return;
 
   // ─── Settings namespace wiring ───
 
@@ -107,13 +106,12 @@ function apply(ctx, config) {
 
   // Use resolved settings for the config
   const cfg = getConfig(config, resolvedSettings);
-  if (!cfg) return;
-
   const state = new Map();
 
   // ─── Honcho API helpers ───
 
   async function honchoRequest(method, path, body) {
+    if (!cfg) return null;
     const url = `${cfg.honchoUrl}${path}`;
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (body !== undefined) opts.body = JSON.stringify(body);
@@ -314,6 +312,7 @@ function apply(ctx, config) {
 
   async function syncSession(sessionId) {
     try {
+      if (!sessionQuery) return;
       const snapshot = await sessionQuery.readSession(sessionId);
       const header = snapshot.session;
       const events = snapshot.events || [];
