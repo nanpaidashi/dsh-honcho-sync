@@ -1,12 +1,14 @@
 # dsh-honcho-sync bundle patch
 #
 # Honcho memory plugin for DeepSeek Harness.
-# Auto-syncs conversation turns and provides memory tools (recall/search/remember).
-# A visual settings panel is available in DSH settings (click "Honcho Memory").
+# Auto-syncs conversation turns to a self-hosted Honcho service,
+# providing 21 tools covering the full Honcho v3 API surface.
 #
 # Environment variables:
 #   HONCHO_URL     - Honcho API base URL (required, e.g. http://localhost:8000)
 #   HONCHO_WORKSPACE - Workspace name (must be configured)
+#   HONCHO_USER_PEER - User peer_id (default: user)
+#   HONCHO_AGENT_PEER - Agent peer_id (default: agent)
 #
 # Installation:
 #   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web

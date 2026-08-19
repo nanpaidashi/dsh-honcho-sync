@@ -2,10 +2,10 @@
 
 [![GitHub](https://img.shields.io/badge/GitHub-nanpaidashi/dsh--honcho--sync-blue)](https://github.com/nanpaidashi/dsh-honcho-sync)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![v0.6.0](https://img.shields.io/badge/version-0.6.0-brightgreen)]()
+[![v0.7.0](https://img.shields.io/badge/version-0.7.0-brightgreen)]()
 
 > **Give your DeepSeek Harness AI persistent memory.**
-> Auto-sync every conversation turn to a self-hosted Honcho service, and equip the AI with **21 tools** covering the full official Honcho v3 API surface. Configure everything from a visual settings panel — no YAML editing required.
+> Auto-sync every conversation turn to a self-hosted Honcho service, and equip the AI with **21 tools** covering the full official Honcho v3 API surface. Configure via environment variables or `cordis.patch.yml`.
 
 ---
 
@@ -19,7 +19,6 @@
 
 | 功能 | 说明 |
 |------|------|
-| **可视化设置面板** | DSH 设置 → "Honcho Memory"，所有配置项图形化编辑 |
 | **自动同步** | 每轮对话自动推送到 Honcho（debounce 3s），watermark 去重 |
 | **Layer-1 上下文注入** | 会话首条消息时自动加载 peer card + representation + session summary |
 | **21 个记忆工具** | 覆盖官方 API：search / dialectic / profile / session / peer / conclude / dream / queue |
@@ -53,55 +52,100 @@
 
 ### 安装
 
-**前提：** 已部署 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务（Docker 一行命令即可）
+**前提：** 已部署 [Honcho](https://github.com/plastic-labs/honcho) 记忆服务
+
+#### 方式 1：从 GitHub 直接安装（推荐）
 
 ```bash
-# 方式 1：从 GitHub 直接安装（推荐）
 dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
+```
 
-# 方式 2：从 npm 安装
-dsh plugin --profile web add @nanpaidashi/dsh-honcho-sync@latest
+#### 方式 2：本地手动安装
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/nanpaidashi/dsh-honcho-sync.git
+cd dsh-honcho-sync
+npm run build  # cp src/index.mjs dist/index.js
+
+# 2. 复制文件到 DSH profile
+cp dist/index.js ~/.dsh/profiles/web/honcho-sync.mjs
+
+# 3. 在 ~/.dsh/profiles/web/cordis.patch.yml 中添加：
+# - insert:
+#     - id: honcho-sync
+#       name: './honcho-sync.mjs'
+
+# 4. 重启 DSH
+systemctl --user restart dsh-web
 ```
 
 ### 配置
 
-**方式 1：可视化面板（推荐）**
+**必须配置 `HONCHO_URL` 和 `HONCHO_WORKSPACE`，二选一：**
 
-打开 DSH → 左下角 **设置** → **Honcho Memory**，直接填写：
-
-- Honcho URL（API 地址）
-- Workspace（工作区名称）
-- User / Agent Peer（标识符）
-- Debounce、Recall Budget、Max Chars（调优参数）
-- Auto Recall / Auto Sync（开关）
-
-点击 **Save** 即生效，无需重启。
-
-**方式 2：环境变量**
+#### 方式 1：环境变量（推荐）
 
 ```bash
-export HONCHO_URL="http://your-honcho-server:8000"   # 必填
-export HONCHO_WORKSPACE="your-workspace"              # 必填
-export HONCHO_USER_PEER="user"                        # 可选
-export HONCHO_AGENT_PEER="agent"                      # 可选
+export HONCHO_URL="http://your-honcho-server:8000"   # 必填 — Honcho API 地址
+export HONCHO_WORKSPACE="hermes"                     # 必填 — Honcho workspace 名称
+export HONCHO_USER_PEER="user"                       # 可选 — 默认 "user"
+export HONCHO_AGENT_PEER="agent"                     # 可选 — 默认 "agent"
 ```
 
-**方式 3：cordis.patch.yml**
+然后在 `~/.dsh/profiles/web/cordis.patch.yml` 中引用：
 
 ```yaml
-- id: honcho-sync
-  config:
-    honchoUrl: "http://your-honcho-server:8000"
-    workspace: "your-workspace"
-    userPeer: "user"
-    agentPeer: "agent"
-    debounceMs: 3000
-    autoRecall: true
-    recallBudget: 2000
-    autoSync: true
-    messageMaxChars: 25000
-    injectionMaxChars: 4000
+- insert:
+    - id: honcho-sync
+      name: './honcho-sync.mjs'
+      config:
+        honchoUrl: __FROM_ENV__
+        workspace: ''
+        userPeer: user
+        agentPeer: agent
+        debounceMs: 3000
+        autoRecall: true
+        recallBudget: 2000
+        autoSync: true
+        messageMaxChars: 25000
+        injectionMaxChars: 4000
 ```
+
+其中 `honchoUrl: __FROM_ENV__` 表示从 `HONCHO_URL` 环境变量读取。
+
+#### 方式 2：直接写在 cordis.patch.yml
+
+```yaml
+- insert:
+    - id: honcho-sync
+      name: './honcho-sync.mjs'
+      config:
+        honchoUrl: "http://192.168.0.4:8000"
+        workspace: "hermes"
+        userPeer: "user"
+        agentPeer: "agent"
+        debounceMs: 3000
+        autoRecall: true
+        recallBudget: 2000
+        autoSync: true
+        messageMaxChars: 25000
+        injectionMaxChars: 4000
+```
+
+#### 方式 3：通过 DSH settings 服务（运行时配置）
+
+插件通过 DSH `settings` 服务注册了 `honcho-memory` 命名空间。如果 DSH 版本支持 settings UI，可以在设置界面直接修改：
+
+- **honchoUrl** — Honcho API 地址
+- **workspace** — Workspace 名称
+- **userPeer / agentPeer** — Peer 标识符
+- **debounceMs** — 同步防抖延迟（100ms+，默认 3000）
+- **autoRecall** — 是否自动 recall（默认 true）
+- **recallBudget** — Recall token 预算（默认 2000）
+- **autoSync** — 是否自动同步（默认 true）
+- **messageMaxChars** — 同步消息最大字符数（默认 25000）
+- **injectionMaxChars** — 首条注入最大字符数（默认 4000）
 
 ### 架构
 
@@ -112,9 +156,7 @@ DSH Session
     │
     ├─ 21 个 honcho_* 工具 ──→ AI 可调用的全量 API 封装
     │
-    ├─ 首条 user message ──→ Layer-1 注入（card + representation + summary）
-    │
-    └─ 设置面板 ──→ /_dsh/dsh-honcho-sync/status (loopback-only)
+    └─ 首条 user message ──→ Layer-1 注入（card + representation + summary）
 ```
 
 ### 同步策略
@@ -122,6 +164,15 @@ DSH Session
 - **Per-day session ID**：`dsh-<cwd>-YYYY-MM-DD`，每天一个 Honcho session，保持检索空间小
 - **Watermark 去重**：记录已同步的 event count，只推送增量
 - **Debounce 3s**：避免高频写入
+
+### 参数调优建议
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `debounceMs` | 3000 | 对话结束后等待多久才推送 Honcho。多轮快速对话可适当增大 |
+| `messageMaxChars` | 25000 | 单次同步的最大消息字符数。对话很长时调大，节省 Honcho token 时调小 |
+| `recallBudget` | 2000 | Layer-1 注入时 recall 的 token 预算。peer card 通常 500-1500 tokens |
+| `injectionMaxChars` | 4000 | Layer-1 注入的最大字符数。包含 peer card + representation + session summary |
 
 ### 依赖
 
@@ -169,13 +220,72 @@ MIT
 
 ### Installation
 
+#### Method 1: Direct from GitHub (Recommended)
+
 ```bash
 dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
 ```
 
+#### Method 2: Manual local installation
+
+```bash
+git clone https://github.com/nanpaidashi/dsh-honcho-sync.git
+cd dsh-honcho-sync
+npm run build
+cp dist/index.js ~/.dsh/profiles/web/honcho-sync.mjs
+# Add to ~/.dsh/profiles/web/cordis.patch.yml:
+# - insert:
+#     - id: honcho-sync
+#       name: './honcho-sync.mjs'
+systemctl --user restart dsh-web
+```
+
 ### Configuration
 
-Visual panel (recommended), environment variables, or cordis.patch.yml — see above.
+**`HONCHO_URL` and `HONCHO_WORKSPACE` are required — configure via one of:**
+
+#### Method 1: Environment Variables (Recommended)
+
+```bash
+export HONCHO_URL="http://your-honcho-server:8000"   # Required
+export HONCHO_WORKSPACE="hermes"                     # Required
+export HONCHO_USER_PEER="user"                       # Optional, default "user"
+export HONCHO_AGENT_PEER="agent"                     # Optional, default "agent"
+```
+
+Then in `~/.dsh/profiles/web/cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: honcho-sync
+      name: './honcho-sync.mjs'
+      config:
+        honchoUrl: __FROM_ENV__
+        workspace: ''
+        debounceMs: 3000
+        autoRecall: true
+        recallBudget: 2000
+        autoSync: true
+        messageMaxChars: 25000
+        injectionMaxChars: 4000
+```
+
+`honchoUrl: __FROM_ENV__` reads from the `HONCHO_URL` environment variable.
+
+#### Method 2: Direct in cordis.patch.yml
+
+```yaml
+- insert:
+    - id: honcho-sync
+      name: './honcho-sync.mjs'
+      config:
+        honchoUrl: "http://192.168.0.4:8000"
+        workspace: "hermes"
+```
+
+#### Method 3: DSH Settings Service (Runtime)
+
+The plugin registers a `honcho-memory` namespace via the DSH `settings` service. If your DSH version supports a settings UI, you can modify all parameters at runtime without restarting.
 
 ### Architecture
 
@@ -186,10 +296,23 @@ DSH Session
     │
     ├─ 21 honcho_* tools ──→ Full API surface callable by AI
     │
-    ├─ First user message ──→ Layer-1 injection (card + representation + summary)
-    │
-    └─ Settings panel ──→ /_dsh/dsh-honcho-sync/status (loopback-only)
+    └─ First user message ──→ Layer-1 injection (card + representation + summary)
 ```
+
+### Sync Strategy
+
+- **Per-day session ID**: `dsh-<cwd>-YYYY-MM-DD`, one Honcho session per day
+- **Watermark deduplication**: tracks synced event count, only pushes deltas
+- **Debounce 3s**: avoids high-frequency writes
+
+### Parameter Tuning
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `debounceMs` | 3000 | Delay before pushing to Honcho after conversation ends |
+| `messageMaxChars` | 25000 | Max characters per sync push |
+| `recallBudget` | 2000 | Token budget for Layer-1 context recall |
+| `injectionMaxChars` | 4000 | Max chars for Layer-1 injection (card + representation + summary) |
 
 ### Dependencies
 
