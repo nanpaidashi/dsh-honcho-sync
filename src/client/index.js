@@ -110,7 +110,7 @@ window.__ModuleLoader__.load({
 			if (!settings) return React.createElement("div", { style: { padding: 16, color: "var(--dsh-text-muted)", fontSize: 13 } }, "Loading...");
 
 			return React.createElement("div", { style: { padding: "4px 0" } },
-				React.createElement(TextRow, { label: "Honcho URL", value: settings.honchoUrl, onChange: function(v) { setSettings(Object.assign(Object.assign({}, settings), { honchoUrl: v })); }, tooltip: "Honcho API base URL (e.g. http://192.168.0.4:8000)" }),
+				React.createElement(TextRow, { label: "Honcho URL", value: settings.honchoUrl, onChange: function(v) { setSettings(Object.assign(Object.assign({}, settings), { honchoUrl: v })); }, tooltip: "Honcho API base URL (e.g. http://localhost:8000)" }),
 				React.createElement(TextRow, { label: "Workspace", value: settings.workspace, onChange: function(v) { setSettings(Object.assign(Object.assign({}, settings), { workspace: v })); }, tooltip: "Honcho workspace name" }),
 				React.createElement(TextRow, { label: "User Peer", value: settings.userPeer, onChange: function(v) { setSettings(Object.assign(Object.assign({}, settings), { userPeer: v })); } }),
 				React.createElement(TextRow, { label: "Agent Peer", value: settings.agentPeer, onChange: function(v) { setSettings(Object.assign(Object.assign({}, settings), { agentPeer: v })); } }),
