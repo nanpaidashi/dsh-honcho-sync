@@ -401,7 +401,7 @@ function apply(ctx, config) {
       description: 'Create or get a Honcho session by ID. Useful for setting up new conversation threads.',
       parameters: {
         session_id: { type: 'string', required: true, description: 'The session ID to create.' },
-        metadata: { type: 'object', description: 'Optional metadata to attach to the session.' },
+        metadata: { type: 'object', description: 'Optional metadata to attach to the session.', additionalProperties: true },
       },
       async execute(args) {
         const body = { id: args.session_id };
