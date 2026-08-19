@@ -1,17 +1,39 @@
 /**
- * @nanpaidashi/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness (v0.6.0)
+ * @nanpaidashi/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness (v0.7.0-merged)
  *
  * Give DSH persistent memory: auto-sync every conversation turn to a
  * self-hosted Honcho service, and equip the AI with a full set of tools
  * covering the official Honcho v3 API surface.
  *
- * Tools provided (grouped by domain):
+ * === Merged Features (v0.7.0) ===
+ *
+ * From GitHub upstream (v0.6.0):
+ *   - Settings namespace wiring with scope.watch() for real-time config updates
+ *   - defineHonchoXxx pattern for individual tool definition
+ *   - ctx.effect(() => toolsReg.register(tool), name) registration
+ *   - buildMemoryContext() with peer cards + representations injection
+ *   - Auto-sync with debounce + lastSyncedEventCount tracking
+ *
+ * From local DSH plugin (自有特色):
+ *   - Semantic deduplication chain: _trimRepresentation / _semanticOverlap /
+ *     _deduplicateSemantic / _extractCardFacts — removes IP/keyword/phrase overlap
+ *     and peer-card-duplicate facts from representation injection
+ *   - Additional tools: honcho_message_send, honcho_message_get, honcho_session_context,
+ *     honcho_peer_list — extends official Honcho API coverage
+ *   - loadState/saveState persistence via ~/.dsh/honcho-sync-state.json — sync cursor
+ *     survives HMR and DSH restart
+ *   - resolveConfig() dynamic reading — each tool reads _resolvedSettings at call time
+ *     (no stale config after settings panel changes)
+ *   - reprMaxObs / reprTimeoutMs / cardTimeoutMs extra config knobs
+ *
+ * Tools provided (25 total, grouped by domain):
  *   Memory  : honcho_recall, honcho_ask, honcho_remember, honcho_context
  *   Search  : honcho_search, honcho_session_search
  *   Profile : honcho_profile, honcho_representation
  *   Session : honcho_session, honcho_session_create, honcho_session_clone,
- *             honcho_session_peers, honcho_session_summaries
- *   Peer    : honcho_peer, honcho_peer_create
+ *             honcho_session_peers, honcho_session_summaries, honcho_session_context
+ *   Peer    : honcho_peer, honcho_peer_create, honcho_peer_list
+ *   Message : honcho_message_send, honcho_message_get
  *   Conclude: honcho_conclude, honcho_conclude_list, honcho_conclude_query
  *   Admin   : honcho_status, honcho_dream, honcho_queue
  *
@@ -32,7 +54,27 @@
 const name = 'honcho-sync';
 const inject = [];
 
-// ─── Config helpers ───
+// ─── Config helpers ────────────────────────────────────────────────────────
+
+// Extended defaults with local plugin knobs
+const DEFAULTS = {
+  honchoUrl: '',
+  workspace: '',
+  userPeer: 'user',
+  agentPeer: 'agent',
+  sessionStrategy: 'per-directory',
+  debounceMs: 3000,
+  autoRecall: true,
+  recallBudget: 2000,
+  autoSync: true,
+  messageMaxChars: 25000,
+  injectionMaxChars: 4000,
+  reprMaxObs: 8,
+  reprTimeoutMs: 8000,
+  cardTimeoutMs: 5000,
+};
+
+let _resolvedSettings = null; // Set by settings panel via scope.watch
 
 function getConfig(config, resolvedSettings) {
   const url = (resolvedSettings?.honchoUrl || config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, '');
@@ -51,32 +93,31 @@ function getConfig(config, resolvedSettings) {
     autoSync: resolvedSettings?.autoSync ?? config?.autoSync ?? true,
     messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? 25000,
     injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? 4000,
+    reprMaxObs: resolvedSettings?.reprMaxObs ?? config?.reprMaxObs ?? DEFAULTS.reprMaxObs,
+    reprTimeoutMs: resolvedSettings?.reprTimeoutMs ?? config?.reprTimeoutMs ?? DEFAULTS.reprTimeoutMs,
+    cardTimeoutMs: resolvedSettings?.cardTimeoutMs ?? config?.cardTimeoutMs ?? DEFAULTS.cardTimeoutMs,
   };
 }
+
+// ─── Persistence (debounce state survives DSH restart) ─────────────────────
+
+const PERSIST_FILE = require('path').join(process.env.HOME || '/root', '.dsh', 'honcho-sync-state.json');
+function loadState() {
+  try { const fs = require('fs'); const d = fs.readFileSync(PERSIST_FILE, 'utf8'); return JSON.parse(d); } catch { return {}; }
+}
+function saveState(s) {
+  try { const fs = require('fs'); fs.writeFileSync(PERSIST_FILE, JSON.stringify(s), 'utf8'); } catch {}
+}
+
+// ─── Main plugin ───────────────────────────────────────────────────────────
 
 function apply(ctx, config) {
   const sessionQuery = ctx.get('sessionQuery');
   const systemPrompt = ctx.get('systemPrompt');
 
-  // ─── Settings namespace wiring ───
+  // ─── Settings namespace wiring (GitHub upstream) ──────────────────────
 
   const HONCHO_NS = 'honcho-memory';
-  const DEFAULTS = {
-    honchoUrl: '',
-    workspace: '',
-    userPeer: 'user',
-    agentPeer: 'agent',
-    sessionStrategy: 'per-directory',
-    debounceMs: 3000,
-    autoRecall: true,
-    recallBudget: 2000,
-    autoSync: true,
-    messageMaxChars: 25000,
-    injectionMaxChars: 4000,
-  };
-
-  let resolvedSettings = { ...DEFAULTS, ...(config || {}) };
-  let configWriter = null;
 
   ctx.inject(['settings'], (settingsCtx) => {
     const scope = settingsCtx.settings.register(
@@ -95,6 +136,9 @@ function apply(ctx, config) {
           autoSync: { type: 'boolean', default: true },
           messageMaxChars: { type: 'integer', default: 25000 },
           injectionMaxChars: { type: 'integer', default: 4000 },
+          reprMaxObs: { type: 'integer', default: 8 },
+          reprTimeoutMs: { type: 'integer', default: 8000 },
+          cardTimeoutMs: { type: 'integer', default: 5000 },
         },
         required: [],
       },
@@ -103,19 +147,19 @@ function apply(ctx, config) {
         if (v.recallBudget !== undefined && v.recallBudget < 1) throw new Error('recall budget must be >= 1');
       }}
     );
-    configWriter = patch => scope.update(patch);
-    resolvedSettings = { ...DEFAULTS, ...config || {}, ...scope.get() };
+    resolvedSettings = { ...DEFAULTS, ...(config || {}), ...scope.get() };
 
     const unwatch = scope.watch(() => {
-      resolvedSettings = { ...DEFAULTS, ...config || {}, ...scope.get() };
+      resolvedSettings = { ...DEFAULTS, ...(config || {}), ...scope.get() };
     });
     settingsCtx.effect(() => unwatch);
   });
 
+  let resolvedSettings = { ...DEFAULTS, ...(config || {}) };
   const cfg = getConfig(config, resolvedSettings);
   const state = new Map();
 
-  // ─── Honcho API helpers ───
+  // ─── Honcho API helpers ────────────────────────────────────────────────
 
   async function honchoRequest(method, path, body, timeoutMs = 15000) {
     if (!cfg) return null;
@@ -163,7 +207,124 @@ function apply(ctx, config) {
       .join('');
   }
 
-  // ─── Memory tools ───
+  // ─── Semantic deduplication chain (local plugin unique features) ──────
+
+  /**
+   * Trim and refine representation text:
+   * 1. Split by top-level [timestamp] blocks
+   * 2. Filter out blocks whose content overlaps with peer card facts (IP/keyword/phrase)
+   * 3. Deduplicate semantically similar blocks
+   * 4. Convert timestamps to CST (+8h), keep last N observations
+   */
+  function _trimRepresentation(text, maxObs, peerCard) {
+    if (!text) return null;
+
+    const lines = text.split('\n');
+    const blocks = [];
+    let current = [];
+    for (const line of lines) {
+      if (/^\[/.test(line.trim()) && !line.trim().startsWith('#')) {
+        if (current.length > 0) blocks.push(current.join('\n'));
+        current = [line];
+      } else {
+        current.push(line);
+      }
+    }
+    if (current.length > 0) blocks.push(current.join('\n'));
+
+    const cardFacts = _extractCardFacts(peerCard);
+
+    const filtered = blocks.filter(block => {
+      const content = _blockText(block);
+      for (const fact of cardFacts) {
+        if (_semanticOverlap(content, fact)) return false;
+      }
+      return true;
+    });
+
+    const deduped = _deduplicateSemantic(filtered);
+
+    const converted = deduped.map(b => {
+      const m = b.match(/^\[(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\]/);
+      if (m) {
+        const date = new Date(m[1] + 'T' + m[2] + 'Z');
+        date.setHours(date.getHours() + 8);
+        const ts = date.toISOString().replace('T', ' ').replace('Z', '').slice(0, 19);
+        return '[' + ts + '] ' + b.slice(m[0].length).trimStart();
+      }
+      return b;
+    });
+    const kept = converted.slice(-maxObs);
+    return kept.join('\n');
+  }
+
+  /** Extract IDENTITY/ATTRIBUTE/RELATIONSHIP/INSTRUCTION facts from a peer card */
+  function _extractCardFacts(card) {
+    if (!Array.isArray(card)) return [];
+    return card
+      .filter(f => f && typeof f === 'string')
+      .map(f => {
+        const m = f.match(/^(?:IDENTITY|ATTRIBUTE|RELATIONSHIP|INSTRUCTION):\s*(.+)$/);
+        return m ? m[1].toLowerCase() : f.toLowerCase();
+      })
+      .filter(f => f.length > 10);
+  }
+
+  /** Extract the body text after the timestamp prefix of a block */
+  function _blockText(block) {
+    const m = block.match(/^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*(.+)$/);
+    return m ? m[1] : block;
+  }
+
+  /**
+   * Semantic overlap detection between two text strings.
+   * Returns true if:
+   *   - Both contain overlapping 192.168.x.x IPs
+   *   - Keyword Jaccard similarity > 0.3
+   *   - Any 3-gram phrase from a appears in b
+   */
+  function _semanticOverlap(a, b) {
+    if (!a || !b) return false;
+    const aL = a.toLowerCase();
+    const bL = b.toLowerCase();
+
+    // IP overlap
+    const ipA = aL.match(/192\.168\.\d+\.\d+/g);
+    const ipB = bL.match(/192\.168\.\d+\.\d+/g);
+    if (ipA && ipB && ipA.some(ip => ipB.includes(ip))) return true;
+
+    // Keyword overlap (Jaccard)
+    const wordsA = new Set(aL.split(/\W+/).filter(w => w.length > 3));
+    const wordsB = new Set(bL.split(/\W+/).filter(w => w.length > 3));
+    let intersection = 0;
+    for (const w of wordsA) {
+      if (wordsB.has(w)) intersection++;
+    }
+    const union = new Set([...wordsA, ...wordsB]).size;
+    if (union === 0) return false;
+    if (intersection / union > 0.3) return true;
+
+    // Key phrase overlap (3-gram)
+    const allWords = aL.split(/\W+/).filter(w => w.length > 2);
+    for (let i = 0; i < allWords.length - 2; i++) {
+      if (bL.includes(allWords.slice(i, i + 3).join(' '))) return true;
+    }
+
+    return false;
+  }
+
+  /** Content-based deduplication: deduplicate blocks with same leading content key */
+  function _deduplicateSemantic(blocks) {
+    const seen = new Map();
+    for (const block of blocks) {
+      const content = _blockText(block);
+      const key = content.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 60);
+      seen.set(key, block);
+    }
+    return Array.from(seen.values());
+  }
+
+  // ─── Memory tools ──────────────────────────────────────────────────────
 
   function defineHonchoRecall() {
     return {
@@ -286,7 +447,7 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Search tools ───
+  // ─── Search tools ──────────────────────────────────────────────────────
 
   function defineHonchoSearch() {
     return {
@@ -334,7 +495,7 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Profile tools ───
+  // ─── Profile tools ─────────────────────────────────────────────────────
 
   function defineHonchoProfile() {
     return {
@@ -374,7 +535,7 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Session tools ───
+  // ─── Session tools ─────────────────────────────────────────────────────
 
   function defineHonchoSession() {
     return {
@@ -491,7 +652,28 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Peer tools ───
+  function defineHonchoSessionContext() {
+    return {
+      name: 'honcho_session_context',
+      description: 'Get the full conversation context for a session from Honcho. Use when you need to read recent conversation history stored in Honcho.',
+      parameters: {
+        session_id: { type: 'string', description: 'Session ID (omit for current cwd-based session).' },
+        tokens: { type: 'integer', description: 'Token budget for the summary (default: 500).' },
+      },
+      async execute(args) {
+        const sid = args.session_id || honchoSessionId('');
+        const tokens = args.tokens || 500;
+        const result = await honchoRequest('GET',
+          `/v3/workspaces/${cfg.workspace}/sessions/${sid}/context?summary=true&tokens=${tokens}`
+        );
+        if (!result) return { ok: true, tool: 'honcho_session_context', text: 'Error retrieving context.' };
+        const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+        return { ok: true, tool: 'honcho_session_context', text: text.slice(0, 10000) || 'No context available.' };
+      },
+    };
+  }
+
+  // ─── Peer tools ────────────────────────────────────────────────────────
 
   function defineHonchoPeer() {
     return {
@@ -531,7 +713,73 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Conclude tools ───
+  function defineHonchoPeerList() {
+    return {
+      name: 'honcho_peer_list',
+      description: 'List all peers in the Honcho workspace.',
+      parameters: {},
+      async execute() {
+        const result = await honchoRequest('POST',
+          `/v3/workspaces/${cfg.workspace}/peers/list`,
+          {}
+        );
+        if (!result) return { ok: true, tool: 'honcho_peer_list', peers: [] };
+        const peers = Array.isArray(result) ? result : (result.peers || []);
+        return { ok: true, tool: 'honcho_peer_list', peers };
+      },
+    };
+  }
+
+  // ─── Message tools (local plugin unique) ───────────────────────────────
+
+  function defineHonchoMessageSend() {
+    return {
+      name: 'honcho_message_send',
+      description: 'Send a message to a Honcho session. Useful for saving facts or adding context to memory.',
+      parameters: {
+        session_id: { type: 'string', description: 'Session ID (omit for current cwd-based session).' },
+        content: { type: 'string', required: true, description: 'The message content.' },
+        role: { type: 'string', enum: ['user', 'assistant'], description: 'Message role (default: user).' },
+        peer_id: { type: 'string', description: 'Peer ID (default: user for user role, agent for assistant role).' },
+      },
+      async execute(args) {
+        const sid = args.session_id || honchoSessionId('');
+        const cfg = getConfig(config, resolvedSettings);
+        const result = await honchoRequest('POST',
+          `/v3/workspaces/${cfg.workspace}/sessions/${sid}/messages`,
+          {
+            messages: [{
+              role: args.role || 'user',
+              content: args.content,
+              peer_id: args.peer_id || (args.role === 'assistant' ? cfg.agentPeer : cfg.userPeer),
+            }],
+          }
+        );
+        if (!result) return { ok: false, tool: 'honcho_message_send', text: 'Error sending message.' };
+        return { ok: true, tool: 'honcho_message_send', text: 'Message sent.' };
+      },
+    };
+  }
+
+  function defineHonchoMessageGet() {
+    return {
+      name: 'honcho_message_get',
+      description: 'Get a single message from a Honcho session by message ID.',
+      parameters: {
+        session_id: { type: 'string', required: true, description: 'The session ID.' },
+        message_id: { type: 'string', required: true, description: 'The message ID.' },
+      },
+      async execute(args) {
+        const result = await honchoRequest('GET',
+          `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/messages/${args.message_id}`
+        );
+        if (!result) return { ok: true, tool: 'honcho_message_get', message: null };
+        return { ok: true, tool: 'honcho_message_get', message: result };
+      },
+    };
+  }
+
+  // ─── Conclude tools ────────────────────────────────────────────────────
 
   function defineHonchoConclude() {
     return {
@@ -595,7 +843,7 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Admin tools ───
+  // ─── Admin tools ───────────────────────────────────────────────────────
 
   function defineHonchoStatus() {
     return {
@@ -653,7 +901,7 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Register all tools ───
+  // ─── Register all tools ────────────────────────────────────────────────
 
   const tools = [
     // Memory
@@ -673,9 +921,14 @@ function apply(ctx, config) {
     defineHonchoSessionClone(),
     defineHonchoSessionPeers(),
     defineHonchoSessionSummaries(),
+    defineHonchoSessionContext(),
     // Peer
     defineHonchoPeer(),
     defineHonchoPeerCreate(),
+    defineHonchoPeerList(),
+    // Message (local plugin unique)
+    defineHonchoMessageSend(),
+    defineHonchoMessageGet(),
     // Conclude
     defineHonchoConclude(),
     defineHonchoConcludeList(),
@@ -696,7 +949,7 @@ function apply(ctx, config) {
     );
   }
 
-  // ─── Context injection on session start (Layer 1) ───
+  // ─── Context injection on session start (Layer 1) ──────────────────────
 
   async function buildMemoryContext(honchoSid) {
     const base = `${cfg.honchoUrl}/v3/workspaces/${cfg.workspace}`;
@@ -704,25 +957,30 @@ function apply(ctx, config) {
     const errors = [];
 
     // Peer cards (GET, immediate).
+    const cards = {};
     for (const peer of [cfg.userPeer, cfg.agentPeer]) {
       try {
-        const d = await honchoRequest('GET', `${base}/peers/${peer}/card`, undefined, 5000);
+        const d = await honchoRequest('GET', `${base}/peers/${peer}/card`, undefined, cfg.cardTimeoutMs);
         if (!d) { errors.push(`card:${peer}:timeout`); continue; }
         const card = Array.isArray(d.peer_card) ? d.peer_card : [];
         if (card.length > 0) {
           parts.push(`[Peer Card: ${peer}]\n${card.join('\n')}`);
         }
+        cards[peer] = card;
       } catch (e) { errors.push(`card:${peer}:${e.message}`); }
     }
 
-    // Representations (POST, may take a few seconds).
+    // Representations (POST, may take a few seconds) — with semantic dedup
     for (const peer of [cfg.userPeer, cfg.agentPeer]) {
       try {
-        const d = await honchoRequest('POST', `${base}/peers/${peer}/representation`, {}, 8000);
+        const d = await honchoRequest('POST', `${base}/peers/${peer}/representation`, {}, cfg.reprTimeoutMs);
         if (!d) { errors.push(`repr:${peer}:timeout`); continue; }
-        const text = typeof d === 'string' ? d : (d.representation || '');
-        if (text && text.trim().length > 0) {
-          parts.push(`[Representation: ${peer}]\n${text.trim()}`);
+        const rawText = typeof d === 'string' ? d : (d.representation || '');
+        if (rawText && rawText.trim().length > 0) {
+          const trimmed = _trimRepresentation(rawText, cfg.reprMaxObs, cards[peer]);
+          if (trimmed) {
+            parts.push(`[Representation: ${peer}]\n${trimmed}`);
+          }
         }
       } catch (e) { errors.push(`repr:${peer}:${e.message}`); }
     }
@@ -791,7 +1049,7 @@ function apply(ctx, config) {
     });
   }
 
-  // ─── Auto-sync ───
+  // ─── Auto-sync with persistence ────────────────────────────────────────
 
   async function postToHoncho(sessionId, messages) {
     try {
@@ -826,8 +1084,9 @@ function apply(ctx, config) {
       const cwd = header.cwd || '';
       const honchoSid = honchoSessionId(cwd);
 
-      // Get sync state: track last synced event count
-      const s = state.get(honchoSid) || { lastSyncedEventCount: 0 };
+      // Get sync state from persistent file (survives restart)
+      const persisted = loadState();
+      const s = persisted[honchoSid] || { lastSyncedEventCount: 0 };
       const lastCount = s.lastSyncedEventCount || 0;
 
       if (events.length <= lastCount) return;
@@ -853,13 +1112,15 @@ function apply(ctx, config) {
       }
 
       if (messages.length === 0) {
-        state.set(honchoSid, { ...s, lastSyncedEventCount: events.length });
+        persisted[honchoSid] = { ...s, lastSyncedEventCount: events.length };
+        saveState(persisted);
         return;
       }
 
       console.log(`[honcho-sync] posting ${messages.length} messages to ${honchoSid}`);
       await postToHoncho(honchoSid, messages);
-      state.set(honchoSid, { ...s, lastSyncedEventCount: events.length });
+      persisted[honchoSid] = { ...s, lastSyncedEventCount: events.length };
+      saveState(persisted);
     } catch (e) {
       console.error(`[honcho-sync] syncSession error:`, e.message);
     }
@@ -895,4 +1156,6 @@ function apply(ctx, config) {
       state.clear();
     };
   });
+}
 
+export { name, inject, apply };
