@@ -1,3 +1,5 @@
+import path from 'node:path';
+import fs from 'node:fs';
 /**
  * @nanpaidashi/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness (v0.7.0-merged)
  *
@@ -80,7 +82,23 @@ function getConfig(config, resolvedSettings) {
   const url = (resolvedSettings?.honchoUrl || config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, '');
   if (!url) {
     console.error('[honcho-sync] HONCHO_URL is required. Set it via environment variable or the settings panel.');
-    return null;
+    // Return a safe default config with Honcho features disabled.
+    // This prevents cfg === null crashes while allowing DSH to start cleanly.
+    return {
+      honchoUrl: '',
+      workspace: resolvedSettings?.workspace || config?.workspace || process.env.HONCHO_WORKSPACE || '',
+      userPeer: resolvedSettings?.userPeer || config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
+      agentPeer: resolvedSettings?.agentPeer || config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
+      debounceMs: resolvedSettings?.debounceMs ?? config?.debounceMs ?? DEFAULTS.debounceMs,
+      autoRecall: false,  // disabled without URL
+      recallBudget: resolvedSettings?.recallBudget ?? config?.recallBudget ?? DEFAULTS.recallBudget,
+      autoSync: false,    // disabled without URL
+      messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? DEFAULTS.messageMaxChars,
+      injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? DEFAULTS.injectionMaxChars,
+      reprMaxObs: resolvedSettings?.reprMaxObs ?? config?.reprMaxObs ?? DEFAULTS.reprMaxObs,
+      reprTimeoutMs: resolvedSettings?.reprTimeoutMs ?? config?.reprTimeoutMs ?? DEFAULTS.reprTimeoutMs,
+      cardTimeoutMs: resolvedSettings?.cardTimeoutMs ?? config?.cardTimeoutMs ?? DEFAULTS.cardTimeoutMs,
+    };
   }
   return {
     honchoUrl: url,
@@ -101,12 +119,12 @@ function getConfig(config, resolvedSettings) {
 
 // ─── Persistence (debounce state survives DSH restart) ─────────────────────
 
-const PERSIST_FILE = require('path').join(process.env.HOME || '/root', '.dsh', 'honcho-sync-state.json');
+const PERSIST_FILE = path.join(process.env.HOME || '/root', '.dsh', 'honcho-sync-state.json');
 function loadState() {
-  try { const fs = require('fs'); const d = fs.readFileSync(PERSIST_FILE, 'utf8'); return JSON.parse(d); } catch { return {}; }
+  try { const d = fs.readFileSync(PERSIST_FILE, 'utf8'); return JSON.parse(d); } catch { return {}; }
 }
 function saveState(s) {
-  try { const fs = require('fs'); fs.writeFileSync(PERSIST_FILE, JSON.stringify(s), 'utf8'); } catch {}
+  try { fs.writeFileSync(PERSIST_FILE, JSON.stringify(s), 'utf8'); } catch {}
 }
 
 // ─── Main plugin ───────────────────────────────────────────────────────────
