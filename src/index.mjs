@@ -64,8 +64,8 @@ const DEFAULTS = {
   recallBudget: 2000,
   autoSync: true,
   messageMaxChars: 25000,
-  injectionMaxChars: 8000, // P1 (2026-08-20): raised from 4000 for richer semantic recall
-  reprMaxObs: 8,
+  injectionMaxChars: 4000, // P2 (2026-08-20): lowered from 8000 for quality-first injection
+  reprMaxObs: 4, // P2 (2026-08-20): lowered from 8 to reduce low-value observations
   reprTimeoutMs: 8000,
   cardTimeoutMs: 5000,
 };
@@ -104,7 +104,7 @@ function getConfig(config, resolvedSettings) {
     recallBudget: resolvedSettings?.recallBudget ?? config?.recallBudget ?? 2000,
     autoSync: resolvedSettings?.autoSync ?? config?.autoSync ?? true,
     messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? 25000,
-    injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? 8000,
+    injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? DEFAULTS.injectionMaxChars,
     reprMaxObs: resolvedSettings?.reprMaxObs ?? config?.reprMaxObs ?? DEFAULTS.reprMaxObs,
     reprTimeoutMs: resolvedSettings?.reprTimeoutMs ?? config?.reprTimeoutMs ?? DEFAULTS.reprTimeoutMs,
     cardTimeoutMs: resolvedSettings?.cardTimeoutMs ?? config?.cardTimeoutMs ?? DEFAULTS.cardTimeoutMs,
@@ -336,12 +336,129 @@ function apply(ctx, config) {
     return Array.from(seen.values());
   }
 
+  /**
+   * P2 (2026-08-20): Filter representation to remove low-value content.
+   * - Remove Pattern [medium] and Pattern [low] blocks entirely (including Type/Sources)
+   * - Remove Premises: and Sources: sections (model doesn't need provenance)
+   * - For Pattern [high]: keep only the pattern description line, remove Type/Sources
+   * - Keep only high-value observations
+   */
+  function _filterRepresentation(text) {
+    if (!text) return null;
+
+    const lines = text.split('\n');
+    const kept = [];
+    let skipUntilBoundary = false; // Skip entire medium/low pattern block
+    let inSources = false; // Inside a Sources section (any level)
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      // Block boundaries: timestamp lines or ## section headers
+      const isBoundary = /^\[\d{4}-\d{2}-\d{2}/.test(trimmed) || /^##/.test(trimmed);
+      if (isBoundary) {
+        skipUntilBoundary = false;
+        inSources = false;
+      }
+
+      // A new Pattern line ends any previous pattern block
+      const patternMatch = trimmed.match(/\*\*Pattern\*\*\s*\[(\w+)\]:/);
+      if (patternMatch) {
+        skipUntilBoundary = false;
+        inSources = false;
+        const level = patternMatch[1].toLowerCase();
+
+        // Skip medium/low patterns entirely (this line + Type + Sources until next boundary)
+        if (level === 'medium' || level === 'low') {
+          skipUntilBoundary = true;
+          continue;
+        }
+
+        // high: keep only the pattern description line
+        kept.push(line);
+        inSources = false;
+        continue;
+      }
+
+      // Inside a skipped medium/low block
+      if (skipUntilBoundary) {
+        continue;
+      }
+
+      // Provenance lines — skip anywhere (they appear both inside and outside
+      // Pattern blocks in Honcho representations).
+      // Sources section (any form: "**Sources**:" or "Sources:") — skip it and its bullets
+      if (/^\*{0,2}Sources\*{0,2}:/.test(trimmed)) {
+        inSources = true;
+        continue;
+      }
+      // Type line (e.g. "**Type**: tendency")
+      if (/^\*{0,2}Type\*{0,2}:/.test(trimmed)) {
+        continue;
+      }
+      // Premises section
+      if (/^Premises:/.test(trimmed)) {
+        inSources = true; // reuse inSources as a generic "skip bullets" flag
+        continue;
+      }
+      // Bullet lines inside an active Sources/Premises section
+      if (inSources) {
+        if (/^- /.test(trimmed) || trimmed.startsWith('... and')) {
+          continue;
+        }
+        // Non-bullet content ends the section
+        inSources = false;
+        // fall through to normal handling below
+      }
+
+      kept.push(line);
+    }
+
+    // Collapse 3+ consecutive blank lines to 1
+    const result = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return result || null;
+  }
+
+  /**
+   * P2 (2026-08-20): Assemble parts by priority.
+   * Priority order: peer-card > session-summary > semantic-recall > representation
+   * Each part must have at least 50% of its content to be included.
+   */
+  function _assembleByPriority(parts, maxChars) {
+    const priorityOrder = [
+      'peer-card',
+      'session-summary',
+      'semantic-recall',
+      'representation'
+    ];
+
+    const sorted = priorityOrder.map(key => ({
+      key,
+      text: parts[key] || ''
+    })).filter(p => p.text);
+
+    let budget = maxChars;
+    const kept = [];
+
+    for (const part of sorted) {
+      if (budget <= 0) break;
+
+      const available = Math.min(part.text.length, budget);
+      if (available >= part.text.length * 0.5) {
+        kept.push(part.text.slice(0, available));
+        budget -= available;
+      }
+    }
+
+    return kept.join('\n\n');
+  }
+
   // ─── Memory tools ──────────────────────────────────────────────────────
 
   function defineHonchoRecall() {
     return {
       name: 'honcho_recall',
-      description: 'Semantic search across Honcho memory (hybrid: raw messages + reasoned conclusions). Fast (2-5s). Returns the most relevant message snippets AND the best-matching explicit/deductive/inductive conclusions. Use for quick lookups: "what was decided about X", "find details on Y". For deep reasoning, use honcho_ask instead.',
+      description: 'Quick semantic search across Honcho memory (messages + conclusions). Use for lookups: "what was decided about X".',
       parameters: {
         query: { type: 'string', required: true, description: 'Search query — describe what you are looking for.' },
         limit: { type: 'integer', description: 'Number of results to return per source. Default 5, max 10.' },
@@ -398,7 +515,7 @@ function apply(ctx, config) {
   function defineHonchoAsk() {
     return {
       name: 'honcho_ask',
-      description: 'Ask the Honcho memory system a question using dialectic reasoning. This queries the peer\'s conversation history and observations to produce an answer. Takes 2-5 minutes on a typical LLM. Use for questions like "what did we discuss about X" or "summarize recent work on Y".',
+      description: 'Ask Honcho a question using dialectic reasoning. Takes 2-5 min. Use for deep questions: "what did we discuss about X".',
       parameters: {
         query: { type: 'string', required: true, description: 'The question to ask the memory system.' },
         peer: { type: 'string', description: `Which peer to query. Default: ${cfg.userPeer}.` },
@@ -422,7 +539,7 @@ function apply(ctx, config) {
   function defineHonchoRemember() {
     return {
       name: 'honcho_remember',
-      description: 'Save an important fact, decision, constraint, or preference to your long-term Honcho memory. Use when the user states something that should persist across sessions.',
+      description: 'Save a fact/decision/preference to Honcho memory. Use when user states something to persist across sessions.',
       parameters: {
         content: { type: 'string', required: true, description: 'The fact or information to remember.' },
         peer_id: { type: 'string', description: 'Who said it (defaults to user peer).' },
@@ -444,7 +561,7 @@ function apply(ctx, config) {
   function defineHonchoContext() {
     return {
       name: 'honcho_context',
-      description: 'Get the full conversation context for a session from Honcho. Use when you need to read recent conversation history stored in Honcho.',
+      description: 'Get full conversation context for a session. Use to read recent history from Honcho.',
       parameters: {
         session_id: { type: 'string', description: 'Session ID (omit for auto-detect from current cwd).' },
         tokens: { type: 'integer', description: 'Token budget for the summary (default: 500).' },
@@ -679,7 +796,7 @@ function apply(ctx, config) {
   function defineHonchoSessionContext() {
     return {
       name: 'honcho_session_context',
-      description: 'Get the full conversation context for a session from Honcho. Use when you need to read recent conversation history stored in Honcho.',
+      description: 'Get full conversation context for a session. Use to read recent history from Honcho.',
       parameters: {
         session_id: { type: 'string', description: 'Session ID (omit for current cwd-based session).' },
         tokens: { type: 'integer', description: 'Token budget for the summary (default: 500).' },
@@ -927,42 +1044,15 @@ function apply(ctx, config) {
     };
   }
 
-  // ─── Register all tools ────────────────────────────────────────────────
+  // ─── Register core tools (P2: reduced from 25 to 4 for context efficiency) ───
+  // The full Honcho API surface remains available via direct HTTP calls
+  // (see README "Advanced usage") or a companion shell script.
 
   const tools = [
-    // Memory
-    defineHonchoRecall(),
-    defineHonchoAsk(),
-    defineHonchoRemember(),
-    defineHonchoContext(),
-    // Search
-    defineHonchoSearch(),
-    defineHonchoSessionSearch(),
-    // Profile
-    defineHonchoProfile(),
-    defineHonchoRepresentation(),
-    // Session
-    defineHonchoSession(),
-    defineHonchoSessionCreate(),
-    defineHonchoSessionClone(),
-    defineHonchoSessionPeers(),
-    defineHonchoSessionSummaries(),
-    defineHonchoSessionContext(),
-    // Peer
-    defineHonchoPeer(),
-    defineHonchoPeerCreate(),
-    defineHonchoPeerList(),
-    // Message (local plugin unique)
-    defineHonchoMessageSend(),
-    defineHonchoMessageGet(),
-    // Conclude
-    defineHonchoConclude(),
-    defineHonchoConcludeList(),
-    defineHonchoConcludeQuery(),
-    // Admin
-    defineHonchoStatus(),
-    defineHonchoDream(),
-    defineHonchoQueue(),
+    defineHonchoRecall(),   // semantic search (messages + conclusions)
+    defineHonchoAsk(),      // deep dialectic reasoning
+    defineHonchoRemember(), // save fact/decision
+    defineHonchoContext(),  // session summary + recall
   ];
 
   // ─── DSH 0.1.0-rc.8 compatibility: JSON Schema + render ──────────────────
@@ -1073,24 +1163,29 @@ function apply(ctx, config) {
   // stable declarative/procedural layer.
   async function buildMemoryContext(honchoSid, searchQuery) {
     const base = `${cfg.honchoUrl}/v3/workspaces/${cfg.workspace}`;
-    const parts = [];
+    const parts = {}; // P2: use object with priority keys
     const errors = [];
 
     // Peer cards (GET, immediate).
     const cards = {};
+    const cardParts = [];
     for (const peer of [cfg.userPeer, cfg.agentPeer]) {
       try {
         const d = await honchoRequest('GET', `${base}/peers/${peer}/card`, undefined, cfg.cardTimeoutMs);
         if (!d) { errors.push(`card:${peer}:timeout`); continue; }
         const card = Array.isArray(d.peer_card) ? d.peer_card : [];
         if (card.length > 0) {
-          parts.push(`[Peer Card: ${peer}]\n${card.join('\n')}`);
+          cardParts.push(`[Peer Card: ${peer}]\n${card.join('\n')}`);
         }
         cards[peer] = card;
       } catch (e) { errors.push(`card:${peer}:${e.message}`); }
     }
+    if (cardParts.length > 0) {
+      parts['peer-card'] = cardParts.join('\n\n');
+    }
 
-    // Representations (POST, may take a few seconds) — with semantic dedup
+    // Representations (POST, may take a few seconds) — with semantic dedup + P2 filtering
+    const reprParts = [];
     for (const peer of [cfg.userPeer, cfg.agentPeer]) {
       try {
         const d = await honchoRequest('POST', `${base}/peers/${peer}/representation`, {}, cfg.reprTimeoutMs);
@@ -1099,10 +1194,17 @@ function apply(ctx, config) {
         if (rawText && rawText.trim().length > 0) {
           const trimmed = _trimRepresentation(rawText, cfg.reprMaxObs, cards[peer]);
           if (trimmed) {
-            parts.push(`[Representation: ${peer}]\n${trimmed}`);
+            // P2: filter out low-value content (medium/low patterns, premises, sources)
+            const filtered = _filterRepresentation(trimmed);
+            if (filtered) {
+              reprParts.push(`[Representation: ${peer}]\n${filtered}`);
+            }
           }
         }
       } catch (e) { errors.push(`repr:${peer}:${e.message}`); }
+    }
+    if (reprParts.length > 0) {
+      parts['representation'] = reprParts.join('\n\n');
     }
 
     // Session context — P1: summary + semantic search (search_query = current
@@ -1121,24 +1223,23 @@ function apply(ctx, config) {
         undefined, 8000
       );
       if (d) {
-        if (d.summary) parts.push(`[Session Summary]\n${d.summary}`);
+        if (d.summary) parts['session-summary'] = `[Session Summary]\n${d.summary}`;
         const searchResults = d.search_results || d.search || [];
         if (Array.isArray(searchResults) && searchResults.length > 0) {
           const lines = searchResults.slice(0, 5).map(r =>
             `- ${(r.content || r.text || JSON.stringify(r)).slice(0, 300)}`
           );
-          parts.push(`[Semantic Recall (relevant to current question)]\n${lines.join('\n')}`);
+          parts['semantic-recall'] = `[Semantic Recall (relevant to current question)]\n${lines.join('\n')}`;
         }
       }
     } catch (e) { errors.push(`context:${e.message}`); }
 
-    if (parts.length === 0) return null;
+    const keys = Object.keys(parts);
+    if (keys.length === 0) return null;
 
-    let body = parts.join('\n\n');
-    const maxChars = cfg.injectionMaxChars || 8000;
-    if (body.length > maxChars) {
-      body = body.slice(0, maxChars) + ' …[truncated]';
-    }
+    // P2: assemble by priority (peer-card > session-summary > semantic-recall > representation)
+    const maxChars = cfg.injectionMaxChars || 4000;
+    const body = _assembleByPriority(parts, maxChars);
 
     const note = errors.length > 0 ? `\n<!-- honcho-sync partial: ${errors.join('; ')} -->` : '';
     return `<memory-context>\n${body}\n</memory-context>${note}`;

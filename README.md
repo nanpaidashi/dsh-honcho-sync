@@ -51,6 +51,14 @@ systemctl --user restart dsh-web
 
 The install is idempotent: it replaces the plugin source file in place. Your configuration (settings panel) and sync state (`~/.dsh/honcho-sync-state.json`) are preserved — no data loss, no re-configuration needed.
 
+### v0.8.0 → v0.8.1 changelog
+
+- **Context efficiency**: Reduced registered tools from 25 to 4 (`honcho_recall`, `honcho_ask`, `honcho_remember`, `honcho_context`) — saves ~7K tokens of tool schema injection per session
+- **Injection quality**: Added `_filterRepresentation()` — removes Pattern [medium]/[low] blocks, Premises/Sources provenance chains, and orphan Type/Sources lines from representation injection
+- **Injection quality**: Added `_assembleByPriority()` — assembles memory-context parts by priority (peer-card > session-summary > semantic-recall > representation) instead of fixed order
+- **Injection budget**: `injectionMaxChars` default 8000 → 4000, `reprMaxObs` default 8 → 4
+- **Tool descriptions**: Shortened all tool descriptions to ~100 chars
+
 ### v0.7.x → v0.8.0 changelog
 
 - **DSH 0.1.0-rc.8 compatibility**: Added `normalizeToolParameters()` to convert legacy parameter shorthand to standard JSON Schema
@@ -301,6 +309,14 @@ systemctl --user restart dsh-web
 ```
 
 安装是幂等的：原地替换插件源码文件。你的配置（环境变量）和同步状态（`~/.dsh/honcho-sync-state.json`）会保留 — 无数据丢失，无需重新配置。
+
+### v0.8.0 → v0.8.1 变更
+
+- **上下文效率**：注册工具从 25 个精简到 4 个（`honcho_recall`、`honcho_ask`、`honcho_remember`、`honcho_context`）— 每会话节省约 7K tokens 的工具 schema 注入
+- **注入质量**：新增 `_filterRepresentation()` — 从表征注入中过滤 Pattern [medium]/[low] 块、Premises/Sources 溯源链、孤立 Type/Sources 行
+- **注入质量**：新增 `_assembleByPriority()` — 按优先级组装 memory-context（peer-card > session-summary > semantic-recall > representation）
+- **注入预算**：`injectionMaxChars` 默认 8000 → 4000，`reprMaxObs` 默认 8 → 4
+- **工具描述**：所有工具描述精简到 ~100 字符
 
 ### v0.7.x → v0.8.0 变更
 
