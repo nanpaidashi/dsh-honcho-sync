@@ -32,6 +32,45 @@ systemctl --user restart dsh-web
 # or: dsh web --restart
 ```
 
+## Upgrading
+
+If you installed an earlier version (v0.6.x or v0.7.0):
+
+```bash
+# Re-run the same install command — it pulls the latest version and overwrites
+dsh plugin --profile web add npm:@nanpaidashi/dsh-honcho-sync dsh web
+# or
+dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
+
+systemctl --user restart dsh-web
+```
+
+The install is idempotent: it replaces the plugin source file in place. Your configuration (settings panel) and sync state (`~/.dsh/honcho-sync-state.json`) are preserved — no data loss, no re-configuration needed.
+
+### v0.7.0 → v0.7.1 changelog
+
+- Fixed `conclusions/query` requiring `filters` parameter
+- Fixed response parsing for `/search`, `/peers/list`, `/summaries`
+- Fixed `POST /conclusions` body format
+- Fixed `schedule_dream` parameter name (`dream_type`)
+- Added 4 tools: `honcho_conclude`, `honcho_conclude_list`, `honcho_conclude_query`, `honcho_message_get`
+- Hybrid recall now searches messages + conclusions in parallel
+
+## Uninstalling
+
+```bash
+# 1. Remove the plugin from DSH
+dsh plugin --profile web remove honcho-sync dsh web
+
+# 2. (Optional) Remove sync state file
+rm ~/.dsh/honcho-sync-state.json
+
+# 3. Restart DSH
+systemctl --user restart dsh-web
+```
+
+> **Note:** Removing the plugin does NOT delete your Honcho data. All messages, conclusions, and peer cards remain on your Honcho server. The plugin is just the bridge — your memory is safe.
+
 ## Configuration
 
 ### Settings Panel (recommended)
