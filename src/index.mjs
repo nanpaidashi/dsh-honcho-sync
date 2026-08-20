@@ -70,7 +70,7 @@ const DEFAULTS = {
   recallBudget: 2000,
   autoSync: true,
   messageMaxChars: 25000,
-  injectionMaxChars: 4000,
+  injectionMaxChars: 8000, // P1 (2026-08-20): raised from 4000 for richer semantic recall
   reprMaxObs: 8,
   reprTimeoutMs: 8000,
   cardTimeoutMs: 5000,
@@ -110,7 +110,7 @@ function getConfig(config, resolvedSettings) {
     recallBudget: resolvedSettings?.recallBudget ?? config?.recallBudget ?? 2000,
     autoSync: resolvedSettings?.autoSync ?? config?.autoSync ?? true,
     messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? 25000,
-    injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? 4000,
+    injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? 8000,
     reprMaxObs: resolvedSettings?.reprMaxObs ?? config?.reprMaxObs ?? DEFAULTS.reprMaxObs,
     reprTimeoutMs: resolvedSettings?.reprTimeoutMs ?? config?.reprTimeoutMs ?? DEFAULTS.reprTimeoutMs,
     cardTimeoutMs: resolvedSettings?.cardTimeoutMs ?? config?.cardTimeoutMs ?? DEFAULTS.cardTimeoutMs,
@@ -153,7 +153,7 @@ function apply(ctx, config) {
           recallBudget: { type: 'integer', default: 2000 },
           autoSync: { type: 'boolean', default: true },
           messageMaxChars: { type: 'integer', default: 25000 },
-          injectionMaxChars: { type: 'integer', default: 4000 },
+          injectionMaxChars: { type: 'integer', default: 8000 },
           reprMaxObs: { type: 'integer', default: 8 },
           reprTimeoutMs: { type: 'integer', default: 8000 },
           cardTimeoutMs: { type: 'integer', default: 5000 },
@@ -207,14 +207,14 @@ function apply(ctx, config) {
     }
   }
 
-  function honchoSessionId(cwd, dateStr) {
+  // P0 fix (2026-08-20): per-directory LONG-LIVED sessions.
+  // Official Honcho docs flag per-day session splitting as an anti-pattern
+  // ("Don't scope sessions too thin") — the background Deriver needs a single
+  // session to accumulate ~1000 tokens before it can reason effectively.
+  // dateStr is accepted for backward compatibility but ignored.
+  function honchoSessionId(cwd, _dateStr) {
     const basePrefix = cwd ? 'dsh-' + cwd.split('/').filter(Boolean).join('-').replace(/[^a-zA-Z0-9_-]/g, '-') : 'dsh-unknown';
-    if (dateStr) return basePrefix + '-' + dateStr;
-    const today = new Date();
-    const yyyy = today.getFullYear();
-    const mm = String(today.getMonth() + 1).padStart(2, '0');
-    const dd = String(today.getDate()).padStart(2, '0');
-    return basePrefix + '-' + yyyy + '-' + mm + '-' + dd;
+    return basePrefix;
   }
 
   function extractText(blocks) {
@@ -347,37 +347,55 @@ function apply(ctx, config) {
   function defineHonchoRecall() {
     return {
       name: 'honcho_recall',
-      description: 'Semantic search across Honcho memory. Fast (2-5s). Returns the most relevant message snippets from recent sessions. Use for quick lookups: "what was decided about X", "find details on Y". For deep reasoning, use honcho_ask instead.',
+      description: 'Semantic search across Honcho memory (hybrid: raw messages + reasoned conclusions). Fast (2-5s). Returns the most relevant message snippets AND the best-matching explicit/deductive/inductive conclusions. Use for quick lookups: "what was decided about X", "find details on Y". For deep reasoning, use honcho_ask instead.',
       parameters: {
         query: { type: 'string', required: true, description: 'Search query — describe what you are looking for.' },
-        limit: { type: 'integer', description: 'Number of results to return. Default 5, max 10.' },
+        limit: { type: 'integer', description: 'Number of results to return per source. Default 5, max 10.' },
       },
       async execute(args, exec) {
         const n = Math.min(Math.max(args.limit || 5, 1), 10);
         const cwd = exec?.agent?.session?.header?.cwd || '';
-        // Build session allowlist: last 7 days
-        const sessionIds = [];
-        const today = new Date();
-        for (let i = 6; i >= 0; i--) {
-          const d = new Date(today);
-          d.setDate(d.getDate() - i);
-          const yyyy = d.getFullYear();
-          const mm = String(d.getMonth() + 1).padStart(2, '0');
-          const dd = String(d.getDate()).padStart(2, '0');
-          sessionIds.push(honchoSessionId(cwd, `${yyyy}-${mm}-${dd}`));
+        const base = `/v3/workspaces/${cfg.workspace}`;
+
+        // P1 (2026-08-20): hybrid recall — messages AND conclusions in parallel.
+        // Conclusions are the reasoned layer (explicit/deductive/inductive);
+        // messages alone miss everything the Deriver/Dreamer has inferred.
+        const [msgResult, conclResult] = await Promise.all([
+          honchoRequest('POST', `${base}/search`,
+            { query: args.query, limit: n, max_tokens: 2000 },
+            30000
+          ),
+          honchoRequest('POST', `${base}/conclusions/query`,
+            { query: args.query, limit: n, max_distance: 0.85, filters: { observer: cfg.agentPeer, observed: cfg.userPeer } },
+            30000
+          ),
+        ]);
+
+        const results = [];
+        // /search returns a bare array (not {results: []})
+        const msgArr = Array.isArray(msgResult) ? msgResult : (msgResult?.results || []);
+        if (msgArr.length > 0) {
+          for (const r of msgArr) {
+            const content = (r.content || '').slice(0, 400);
+            const peer = r.peer_id || '?';
+            const ts = (r.created_at || '').replace('T', ' ').replace('Z', '').slice(0, 16);
+            results.push(`[message ${peer} ${ts}] ${content}`);
+          }
+        } else if (!msgResult) {
+          results.push('[message search failed — server error or timeout]');
         }
-        const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/search`,
-          { query: args.query, limit: n, filters: { session_id: { "in": sessionIds } } },
-          30000
-        );
-        if (!result) return { ok: true, tool: 'honcho_recall', results: ['Error contacting Honcho server.'], count: 0 };
-        const results = (result.results || []).map(r => {
-          const content = (r.content || '').slice(0, 500);
-          const peer = r.peer_id || '?';
-          const ts = (r.created_at || '').replace('T', ' ').replace('Z', '').slice(0, 16);
-          return `[${peer} ${ts}] ${content}`;
-        });
+        // /conclusions/query returns bare array or {results: []}
+        const conclArr = Array.isArray(conclResult) ? conclResult : (conclResult?.results || []);
+        if (conclArr.length > 0) {
+          for (const r of conclResult.results) {
+            const text = (r.conclusion || r.content || '').slice(0, 400);
+            const type = r.conclusion_type || 'unknown';
+            const conf = r.confidence != null ? ` conf=${Number(r.confidence).toFixed(2)}` : '';
+            const peer = r.peer_id || r.observer || '?';
+            results.push(`[conclusion:${type} ${peer}${conf}] ${text}`);
+          }
+        }
+        if (results.length === 0) results.push('No results found in messages or conclusions.');
         return { ok: true, tool: 'honcho_recall', results, count: results.length };
       },
     };
@@ -393,25 +411,11 @@ function apply(ctx, config) {
       },
       async execute(args, exec) {
         const targetPeer = args.peer || cfg.userPeer;
-        const cwd = exec?.agent?.session?.header?.cwd || '';
-        // Build session allowlist: last 7 days
-        const sessionIds = [];
-        const today = new Date();
-        for (let i = 6; i >= 0; i--) {
-          const d = new Date(today);
-          d.setDate(d.getDate() - i);
-          const yyyy = d.getFullYear();
-          const mm = String(d.getMonth() + 1).padStart(2, '0');
-          const dd = String(d.getDate()).padStart(2, '0');
-          sessionIds.push(honchoSessionId(cwd, `${yyyy}-${mm}-${dd}`));
-        }
+        // P1 (2026-08-20): no date-window filter — sessions are long-lived per
+        // directory, so the dialectic can reason over the full history.
         const result = await honchoRequest('POST',
           `/v3/workspaces/${cfg.workspace}/peers/${targetPeer}/chat`,
-          {
-            session_id: sessionIds[0],
-            filters: { session_id: { "in": sessionIds } },
-            query: args.query,
-          },
+          { query: args.query },
           300000 // 5 min cap for dialectic
         );
         if (!result) return { ok: true, tool: 'honcho_ask', answer: 'Error contacting Honcho server or timeout.' };
@@ -482,7 +486,8 @@ function apply(ctx, config) {
           { query: args.query, limit: args.limit || 10, max_tokens: args.max_tokens || 2000 }
         );
         if (!result) return { ok: true, tool: 'honcho_search', results: ['Error contacting Honcho server.'], count: 0 };
-        const results = (result.results || []).map(r =>
+        const arr = Array.isArray(result) ? result : (result.results || []);
+        const results = arr.map(r =>
           `[${r.peer_id || '?'}] ${(r.content || '').slice(0, 500)}`
         );
         return { ok: true, tool: 'honcho_search', results, count: results.length };
@@ -664,7 +669,14 @@ function apply(ctx, config) {
           `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/summaries`
         );
         if (!result) return { ok: true, tool: 'honcho_session_summaries', summaries: [] };
-        const summaries = Array.isArray(result) ? result : (result.summaries || []);
+        // API returns a session object with short_summary, or an array of summaries
+        if (Array.isArray(result)) {
+          return { ok: true, tool: 'honcho_session_summaries', summaries: result };
+        }
+        const summaries = [];
+        if (result.short_summary) summaries.push(result.short_summary);
+        if (result.long_summary) summaries.push(result.long_summary);
+        if (result.summaries) summaries.push(...(Array.isArray(result.summaries) ? result.summaries : [result.summaries]));
         return { ok: true, tool: 'honcho_session_summaries', summaries };
       },
     };
@@ -704,7 +716,7 @@ function apply(ctx, config) {
           {}
         );
         if (!result) return { ok: true, tool: 'honcho_peer', peers: [] };
-        const peers = Array.isArray(result) ? result : (result.peers || []);
+        const peers = Array.isArray(result) ? result : (result.items || result.peers || []);
         return { ok: true, tool: 'honcho_peer', peers };
       },
     };
@@ -742,7 +754,7 @@ function apply(ctx, config) {
           {}
         );
         if (!result) return { ok: true, tool: 'honcho_peer_list', peers: [] };
-        const peers = Array.isArray(result) ? result : (result.peers || []);
+        const peers = Array.isArray(result) ? result : (result.items || result.peers || []);
         return { ok: true, tool: 'honcho_peer_list', peers };
       },
     };
@@ -809,12 +821,14 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const peer = args.peer_id || cfg.userPeer;
+        // API expects { conclusions: [{ content, peer_id, observer_id }] }
         const result = await honchoRequest('POST',
           `/v3/workspaces/${cfg.workspace}/conclusions`,
-          { content: args.content, peer_id: peer }
+          { conclusions: [{ content: args.content, peer_id: peer, observer_id: cfg.agentPeer, observed_id: peer }] }
         );
         if (!result) return { ok: false, tool: 'honcho_conclude', text: 'Error creating conclusion.' };
-        return { ok: true, tool: 'honcho_conclude', text: 'Conclusion saved.', id: result.id };
+        const id = Array.isArray(result) ? result[0]?.id : (result.items?.[0]?.id || result.id);
+        return { ok: true, tool: 'honcho_conclude', text: 'Conclusion saved.', id };
       },
     };
   }
@@ -835,7 +849,7 @@ function apply(ctx, config) {
           body
         );
         if (!result) return { ok: true, tool: 'honcho_conclude_list', conclusions: [] };
-        const conclusions = Array.isArray(result) ? result : (result.conclusions || []);
+        const conclusions = Array.isArray(result) ? result : (result.items || result.conclusions || []);
         return { ok: true, tool: 'honcho_conclude_list', conclusions };
       },
     };
@@ -852,10 +866,10 @@ function apply(ctx, config) {
       async execute(args) {
         const result = await honchoRequest('POST',
           `/v3/workspaces/${cfg.workspace}/conclusions/query`,
-          { query: args.query, limit: args.limit || 10 }
+          { query: args.query, limit: args.limit || 10, filters: { observer: cfg.agentPeer, observed: cfg.userPeer } }
         );
         if (!result) return { ok: true, tool: 'honcho_conclude_query', conclusions: [] };
-        const conclusions = Array.isArray(result) ? result : (result.conclusions || []);
+        const conclusions = Array.isArray(result) ? result : (result.items || result.conclusions || []);
         return { ok: true, tool: 'honcho_conclude_query', conclusions };
       },
     };
@@ -896,7 +910,7 @@ function apply(ctx, config) {
         const observed = args.observed || cfg.userPeer;
         const result = await honchoRequest('POST',
           `/v3/workspaces/${cfg.workspace}/schedule_dream`,
-          { type: args.dream_type || 'card_refresh', observer, observed }
+          { dream_type: args.dream_type || 'card_refresh', observer, observed }
         );
         if (!result) return { ok: false, tool: 'honcho_dream', text: 'Error scheduling dream.' };
         return { ok: true, tool: 'honcho_dream', text: `Dream scheduled: ${args.dream_type || 'card_refresh'}.` };
@@ -969,7 +983,13 @@ function apply(ctx, config) {
 
   // ─── Context injection on session start (Layer 1) ──────────────────────
 
-  async function buildMemoryContext(honchoSid) {
+  // P1 (2026-08-20): semantic-aware memory injection.
+  // Old: summary + tokens only (2 of 11 context() params).
+  // New: adds search_query (current user message) so the injected context is
+  // semantically relevant to what the user is actually asking — the "brain
+  // associative recall" step. Cards + representations still injected as the
+  // stable declarative/procedural layer.
+  async function buildMemoryContext(honchoSid, searchQuery) {
     const base = `${cfg.honchoUrl}/v3/workspaces/${cfg.workspace}`;
     const parts = [];
     const errors = [];
@@ -1003,19 +1023,37 @@ function apply(ctx, config) {
       } catch (e) { errors.push(`repr:${peer}:${e.message}`); }
     }
 
-    // Session summary + context extras.
+    // Session context — P1: summary + semantic search (search_query = current
+    // user message) in one call. limit_to_session keeps it scoped to this
+    // directory's long-lived session.
     try {
+      const params = new URLSearchParams({ summary: 'true', tokens: '500' });
+      if (searchQuery && searchQuery.trim().length > 0) {
+        params.set('search_query', searchQuery.trim().slice(0, 300));
+        params.set('search_top_k', '5');
+        params.set('search_max_distance', '0.85');
+        params.set('limit_to_session', 'true');
+      }
       const d = await honchoRequest('GET',
-        `${base}/sessions/${honchoSid}/context?summary=true&tokens=500`,
-        undefined, 5000
+        `${base}/sessions/${honchoSid}/context?${params.toString()}`,
+        undefined, 8000
       );
-      if (d && d.summary) parts.push(`[Session Summary]\n${d.summary}`);
+      if (d) {
+        if (d.summary) parts.push(`[Session Summary]\n${d.summary}`);
+        const searchResults = d.search_results || d.search || [];
+        if (Array.isArray(searchResults) && searchResults.length > 0) {
+          const lines = searchResults.slice(0, 5).map(r =>
+            `- ${(r.content || r.text || JSON.stringify(r)).slice(0, 300)}`
+          );
+          parts.push(`[Semantic Recall (relevant to current question)]\n${lines.join('\n')}`);
+        }
+      }
     } catch (e) { errors.push(`context:${e.message}`); }
 
     if (parts.length === 0) return null;
 
     let body = parts.join('\n\n');
-    const maxChars = cfg.injectionMaxChars || 4000;
+    const maxChars = cfg.injectionMaxChars || 8000;
     if (body.length > maxChars) {
       body = body.slice(0, maxChars) + ' …[truncated]';
     }
@@ -1042,7 +1080,10 @@ function apply(ctx, config) {
         const cwd = header.cwd || '';
         const honchoSid = honchoSessionId(cwd);
 
-        const text = await buildMemoryContext(honchoSid);
+        // P1: use the user's current message as the semantic search query so
+        // the injected recall is associative (brain-like), not just recency.
+        const userMsgText = extractText(event?.data?.content) || '';
+        const text = await buildMemoryContext(honchoSid, userMsgText);
         if (text === null) return;
 
         const dispose = systemPrompt.context({

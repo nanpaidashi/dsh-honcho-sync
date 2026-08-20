@@ -1,44 +1,40 @@
 {
   "name": "@nanpaidashi/dsh-honcho-sync",
-  "version": "0.7.0",
-  "description": "DSH plugin: auto-sync conversation turns to Honcho memory service with full Honcho v3 API tools",
+  "version": "0.7.1",
+  "description": "Honcho Memory Plugin for DeepSeek Harness — persistent AI memory with auto-sync, hybrid recall, and 25 API tools",
   "type": "module",
-  "main": "./dist/index.js",
-  "exports": {
-    ".": {
-      "import": "./dist/index.js"
-    },
-    "./package.json": "./package.json"
-  },
+  "main": "./src/index.mjs",
+  "files": [
+    "src/index.mjs",
+    "README.md"
+  ],
   "scripts": {
-    "build": "cp src/index.mjs dist/index.js"
+    "test": "node --check src/index.mjs && echo 'syntax OK'"
   },
   "keywords": [
     "deepseek-harness",
     "dsh",
     "honcho",
     "memory",
-    "cordis",
     "plugin",
-    "long-term-memory"
+    "persistent-memory",
+    "ai-memory"
   ],
+  "author": "nanpaidashi",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nanpaidashi/dsh-honcho-sync"
+    "url": "https://github.com/nanpaidashi/dsh-honcho-sync.git"
   },
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
+  "engines": {
+    "node": ">=18.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.0",
-    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6",
-    "@deepseek-ai/schemastery": ">=3.0.0"
+    "@honcho/honcho": ">=3.0.0"
   },
-  "files": [
-    "dist/",
-    "cordis.patch.yml"
-  ]
+  "peerDependenciesMeta": {
+    "@honcho/honcho": {
+      "optional": true
+    }
+  }
 }

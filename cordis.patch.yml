@@ -2,7 +2,7 @@
 #
 # Honcho memory plugin for DeepSeek Harness.
 # Auto-syncs conversation turns to a self-hosted Honcho service,
-# providing 21 tools covering the full Honcho v3 API surface.
+# providing 25 tools covering the full Honcho v3 API surface.
 #
 # Environment variables:
 #   HONCHO_URL     - Honcho API base URL (required, e.g. http://localhost:8000)
