@@ -1,6 +1,6 @@
 {
   "name": "@nanpaidashi/dsh-honcho-sync",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "description": "Honcho Memory Plugin for DeepSeek Harness — persistent AI memory with auto-sync, hybrid recall, and 25 API tools",
   "type": "module",
   "main": "./src/index.mjs",

@@ -1,32 +1,27 @@
 import path from 'node:path';
 import fs from 'node:fs';
 /**
- * @nanpaidashi/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness (v0.7.0-merged)
+ * @nanpaidashi/dsh-honcho-sync — Honcho Memory Plugin for DeepSeek Harness (v0.8.0)
  *
  * Give DSH persistent memory: auto-sync every conversation turn to a
  * self-hosted Honcho service, and equip the AI with a full set of tools
  * covering the official Honcho v3 API surface.
  *
- * === Merged Features (v0.7.0) ===
+ * === v0.8.0: DSH 0.1.0-rc.8 Compatibility ===
  *
- * From GitHub upstream (v0.6.0):
- *   - Settings namespace wiring with scope.watch() for real-time config updates
- *   - defineHonchoXxx pattern for individual tool definition
- *   - ctx.effect(() => toolsReg.register(tool), name) registration
- *   - buildMemoryContext() with peer cards + representations injection
+ * - normalizeToolParameters(): Converts legacy parameter shorthand to standard JSON Schema
+ *   (required by DSH >= 2026 for strict schema validation)
+ * - output.render: Returns content blocks array [{ type: 'text', text: '...' }]
+ *   (required by DSH >= 2026; returning a string causes "content is not iterable")
+ *
+ * === Features ===
+ *
+ * Core:
  *   - Auto-sync with debounce + lastSyncedEventCount tracking
- *
- * From local DSH plugin (自有特色):
+ *   - buildMemoryContext() with peer cards + representations injection
  *   - Semantic deduplication chain: _trimRepresentation / _semanticOverlap /
- *     _deduplicateSemantic / _extractCardFacts — removes IP/keyword/phrase overlap
- *     and peer-card-duplicate facts from representation injection
- *   - Additional tools: honcho_message_send, honcho_message_get, honcho_session_context,
- *     honcho_peer_list — extends official Honcho API coverage
- *   - loadState/saveState persistence via ~/.dsh/honcho-sync-state.json — sync cursor
- *     survives HMR and DSH restart
- *   - resolveConfig() dynamic reading — each tool reads _resolvedSettings at call time
- *     (no stale config after settings panel changes)
- *   - reprMaxObs / reprTimeoutMs / cardTimeoutMs extra config knobs
+ *     _deduplicateSemantic / _extractCardFacts
+ *   - loadState/saveState persistence via ~/.dsh/honcho-sync-state.json
  *
  * Tools provided (25 total, grouped by domain):
  *   Memory  : honcho_recall, honcho_ask, honcho_remember, honcho_context
@@ -39,16 +34,15 @@ import fs from 'node:fs';
  *   Conclude: honcho_conclude, honcho_conclude_list, honcho_conclude_query
  *   Admin   : honcho_status, honcho_dream, honcho_queue
  *
- * A visual settings panel is available in DSH settings (click "Honcho Memory").
+ * Configuration (NO settings panel — use environment variables):
+ *   Edit ~/.config/systemd/user/dsh-web.service and add:
+ *     Environment="HONCHO_URL=http://localhost:8000"
+ *     Environment="HONCHO_WORKSPACE=my-workspace"
+ *     Environment="HONCHO_USER_PEER=user"
+ *     Environment="HONCHO_AGENT_PEER=agent"
  *
  * Installation:
  *   dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync dsh web
- *
- * Environment variables:
- *   HONCHO_URL     - Honcho API base URL (required, e.g. http://localhost:8000)
- *   HONCHO_WORKSPACE - Workspace name (no default; must be configured)
- *   HONCHO_USER_PEER - User peer_id (default: user)
- *   HONCHO_AGENT_PEER - Agent peer_id (default: agent)
  *
  * @module @nanpaidashi/dsh-honcho-sync
  */
@@ -971,7 +965,95 @@ function apply(ctx, config) {
     defineHonchoQueue(),
   ];
 
+  // ─── DSH 0.1.0-rc.8 compatibility: JSON Schema + render ──────────────────
+
+  function normalizeToolParameters(parameters) {
+    // Already a JSON Schema object.
+    if (
+      parameters &&
+      typeof parameters === 'object' &&
+      parameters.type === 'object' &&
+      parameters.properties &&
+      typeof parameters.properties === 'object'
+    ) {
+      return parameters;
+    }
+
+    // Empty parameter list.
+    if (
+      !parameters ||
+      typeof parameters !== 'object' ||
+      Array.isArray(parameters) ||
+      Object.keys(parameters).length === 0
+    ) {
+      return {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      };
+    }
+
+    const properties = {};
+    const required = [];
+
+    for (const [key, spec] of Object.entries(parameters)) {
+      if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+        properties[key] = {};
+        continue;
+      }
+
+      // Copy the old parameter specification.
+      const prop = { ...spec };
+
+      // `required` belongs to the parent JSON Schema, not the property.
+      if (prop.required === true) {
+        required.push(key);
+        delete prop.required;
+      }
+
+      properties[key] = prop;
+    }
+
+    const schema = {
+      type: 'object',
+      properties,
+      additionalProperties: false,
+    };
+
+    if (required.length > 0) {
+      schema.required = required;
+    }
+
+    return schema;
+  }
+
   for (const tool of tools) {
+    // Convert legacy parameter shorthand to standard JSON Schema.
+    tool.parameters = normalizeToolParameters(tool.parameters);
+
+    // DSH >= 2026 requires every tool to declare output { schema, render }.
+    // Honcho plugin tools return { ok, tool, text, ... } objects.
+    // render MUST return an ARRAY of content blocks: [{ type: 'text', text: '...' }].
+    // If value has a 'text' field, show that; otherwise JSON-serialize the whole object.
+    if (!tool.output) {
+      tool.output = {
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+        },
+        render: (_args, value) => {
+          let text;
+          if (typeof value === 'string') text = value;
+          else if (value && typeof value === 'object') {
+            if (typeof value.text === 'string') text = value.text;
+            else { try { text = JSON.stringify(value, null, 2); } catch { text = String(value); } }
+          }
+          else text = String(value);
+          return [{ type: 'text', text }];
+        },
+      };
+    }
+
     ctx.effect(
       () => {
         const toolsReg = ctx.get('tools');

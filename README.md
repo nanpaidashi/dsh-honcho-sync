@@ -51,8 +51,11 @@ systemctl --user restart dsh-web
 
 The install is idempotent: it replaces the plugin source file in place. Your configuration (settings panel) and sync state (`~/.dsh/honcho-sync-state.json`) are preserved — no data loss, no re-configuration needed.
 
-### v0.7.0 → v0.7.1 changelog
+### v0.7.x → v0.8.0 changelog
 
+- **DSH 0.1.0-rc.8 compatibility**: Added `normalizeToolParameters()` to convert legacy parameter shorthand to standard JSON Schema
+- **DSH 0.1.0-rc.8 compatibility**: Added `output.render` returning content blocks array (required by DSH >= 2026)
+- **README**: Removed settings panel references — configuration is done via environment variables in `~/.config/systemd/user/dsh-web.service`
 - Fixed `conclusions/query` requiring `filters` parameter
 - Fixed response parsing for `/search`, `/peers/list`, `/summaries`
 - Fixed `POST /conclusions` body format
@@ -77,35 +80,42 @@ systemctl --user restart dsh-web
 
 ## Configuration
 
-### Settings Panel (recommended)
+**There is no settings panel.** All configuration is done via environment variables in your DSH service file.
 
-After installation, open DSH Settings → **Honcho Memory** to configure:
-
-| Setting | Description | Default |
-|---------|-------------|---------|
-| `honchoUrl` | Honcho API base URL | *(required)* |
-| `workspace` | Honcho workspace name | *(required)* |
-| `userPeer` | Peer ID representing the user | `user` |
-| `agentPeer` | Peer ID representing the agent | `agent` |
-| `sessionStrategy` | `per-directory` or `global` | `per-directory` |
-| `debounceMs` | Auto-sync debounce (ms) | `3000` |
-| `autoRecall` | Inject memory context on session start | `true` |
-| `recallBudget` | Token budget for recall | `2000` |
-| `autoSync` | Enable auto-sync | `true` |
-| `messageMaxChars` | Max chars per synced message | `25000` |
-| `injectionMaxChars` | Max chars for injected context | `8000` |
-| `reprMaxObs` | Max observations in representation | `8` |
-| `reprTimeoutMs` | Representation API timeout (ms) | `8000` |
-| `cardTimeoutMs` | Peer card API timeout (ms) | `5000` |
-
-### Environment Variables (alternative)
+### Step 1: Edit the DSH service file
 
 ```bash
-export HONCHO_URL="http://localhost:8000"
-export HONCHO_WORKSPACE="my-workspace"
-export HONCHO_USER_PEER="user"
-export HONCHO_AGENT_PEER="agent"
+# For systemd (Linux)
+nano ~/.config/systemd/user/dsh-web.service
 ```
+
+Add these environment variables to the `[Service]` section:
+
+```ini
+[Service]
+Environment="HONCHO_URL=http://localhost:8000"
+Environment="HONCHO_WORKSPACE=my-workspace"
+Environment="HONCHO_USER_PEER=user"
+Environment="HONCHO_AGENT_PEER=agent"
+```
+
+### Step 2: Apply the changes
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart dsh-web
+```
+
+### Configuration reference
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HONCHO_URL` | Honcho API base URL | *(required)* |
+| `HONCHO_WORKSPACE` | Honcho workspace name | *(required)* |
+| `HONCHO_USER_PEER` | Peer ID representing the user | `user` |
+| `HONCHO_AGENT_PEER` | Peer ID representing the agent | `agent` |
+
+> **Note:** Advanced options (debounce, recall budget, timeouts) use sensible defaults and rarely need tuning. If you do need to customize them, edit the `DEFAULTS` object at the top of `src/index.mjs`.
 
 ### Honcho Server Setup
 
@@ -229,7 +239,7 @@ When `autoRecall` is enabled, on the first user message of each session:
 
 | Symptom | Fix |
 |---------|-----|
-| `HONCHO_URL is required` at boot | Set via settings panel or env var. This message is benign if settings load asynchronously. |
+| `HONCHO_URL is required` at boot | Set via environment variable in `~/.config/systemd/user/dsh-web.service`. |
 | No sync happening | Check `autoSync` is `true`, verify Honcho URL is reachable, check logs: `journalctl --user -u dsh-web \| grep honcho` |
 | Recall returns empty | Ensure Deriver has processed messages (check `honcho_queue`), wait a few minutes after first sync |
 | `401 Unauthorized` | Check your Honcho API key in server config |
@@ -290,10 +300,13 @@ dsh plugin --profile web add link:https://github.com/nanpaidashi/dsh-honcho-sync
 systemctl --user restart dsh-web
 ```
 
-安装是幂等的：原地替换插件源码文件。你的配置（设置面板）和同步状态（`~/.dsh/honcho-sync-state.json`）会保留 — 无数据丢失，无需重新配置。
+安装是幂等的：原地替换插件源码文件。你的配置（环境变量）和同步状态（`~/.dsh/honcho-sync-state.json`）会保留 — 无数据丢失，无需重新配置。
 
-### v0.7.0 → v0.7.1 变更
+### v0.7.x → v0.8.0 变更
 
+- **DSH 0.1.0-rc.8 兼容**：添加 `normalizeToolParameters()` 将旧式参数简写转换为标准 JSON Schema
+- **DSH 0.1.0-rc.8 兼容**：添加 `output.render` 返回 content blocks 数组（DSH >= 2026 要求）
+- **README**：移除设置面板说明 — 配置通过 `~/.config/systemd/user/dsh-web.service` 中的环境变量完成
 - 修复 `conclusions/query` 需要 `filters` 参数
 - 修复 `/search`、`/peers/list`、`/summaries` 响应解析
 - 修复 `POST /conclusions` 请求体格式
@@ -318,35 +331,42 @@ systemctl --user restart dsh-web
 
 ## 配置
 
-### 设置面板（推荐）
+**没有设置面板。** 所有配置通过 DSH 服务文件中的环境变量完成。
 
-安装后，打开 DSH 设置 → **Honcho Memory** 进行配置：
-
-| 设置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `honchoUrl` | Honcho API 地址 | *（必填）* |
-| `workspace` | Honcho 工作区名 | *（必填）* |
-| `userPeer` | 用户 peer ID | `user` |
-| `agentPeer` | Agent peer ID | `agent` |
-| `sessionStrategy` | `per-directory` 或 `global` | `per-directory` |
-| `debounceMs` | 自动同步防抖（毫秒） | `3000` |
-| `autoRecall` | 会话开始时注入记忆上下文 | `true` |
-| `recallBudget` | 召回 token 预算 | `2000` |
-| `autoSync` | 启用自动同步 | `true` |
-| `messageMaxChars` | 单条同步消息最大字符数 | `25000` |
-| `injectionMaxChars` | 注入上下文最大字符数 | `8000` |
-| `reprMaxObs` | 表征中最大观察数 | `8` |
-| `reprTimeoutMs` | 表征 API 超时（毫秒） | `8000` |
-| `cardTimeoutMs` | Peer 卡片 API 超时（毫秒） | `5000` |
-
-### 环境变量（替代方式）
+### 第一步：编辑 DSH 服务文件
 
 ```bash
-export HONCHO_URL="http://localhost:8000"
-export HONCHO_WORKSPACE="my-workspace"
-export HONCHO_USER_PEER="user"
-export HONCHO_AGENT_PEER="agent"
+# systemd (Linux)
+nano ~/.config/systemd/user/dsh-web.service
 ```
+
+在 `[Service]` 部分添加环境变量：
+
+```ini
+[Service]
+Environment="HONCHO_URL=http://localhost:8000"
+Environment="HONCHO_WORKSPACE=my-workspace"
+Environment="HONCHO_USER_PEER=user"
+Environment="HONCHO_AGENT_PEER=agent"
+```
+
+### 第二步：应用更改
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart dsh-web
+```
+
+### 配置参考
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `HONCHO_URL` | Honcho API 地址 | *(必填)* |
+| `HONCHO_WORKSPACE` | Honcho 工作区名称 | *(必填)* |
+| `HONCHO_USER_PEER` | 用户 peer ID | `user` |
+| `HONCHO_AGENT_PEER` | Agent peer ID | `agent` |
+
+> **注意：** 高级选项（防抖、召回预算、超时）使用合理的默认值，很少需要调整。如需自定义，编辑 `src/index.mjs` 顶部的 `DEFAULTS` 对象。
 
 ### Honcho 服务器搭建
 
@@ -464,7 +484,7 @@ curl -X POST http://localhost:8000/v3/workspaces/my-workspace/peers \
 
 - 所有数据保留在**你的** Honcho 服务器上。无第三方数据传输。
 - 插件不记录消息内容。
-- 配置（URL、工作区、peer ID）存储在 DSH 设置中，不在插件源码里。
+- 配置（URL、工作区、peer ID）通过环境变量存储在 DSH 服务文件中，不在插件源码里。
 
 ## 故障排查
 
