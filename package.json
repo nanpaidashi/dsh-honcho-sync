@@ -30,10 +30,14 @@
     "node": ">=18.0.0"
   },
   "peerDependencies": {
-    "@honcho/honcho": ">=3.0.0"
+    "@honcho/honcho": ">=3.0.0",
+    "@deepseek-ai/schemastery": ">=3.0.0"
   },
   "peerDependenciesMeta": {
     "@honcho/honcho": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
       "optional": true
     }
   }
