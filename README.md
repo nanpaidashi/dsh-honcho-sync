@@ -51,6 +51,19 @@ systemctl --user restart dsh-web
 
 The install is idempotent: it replaces the plugin source file in place. Your configuration (settings panel) and sync state (`~/.dsh/honcho-sync-state.json`) are preserved — no data loss, no re-configuration needed.
 
+### Unreleased
+
+- **Fix: memory injection never ran.** `buildMemoryContext()` built an absolute base URL and passed it to `honchoRequest()`, which prepends `honchoUrl` again, so every request failed with `TypeError: Failed to parse URL from <url><url>`. The error was swallowed and returned as `null`, so no memory ever reached the prompt. The base path is now relative, and `honchoRequest()` refuses a non-relative path with an explicit message.
+- **Fix: injection used endpoints that cannot answer the question it asked.** Peer card and representation now come from one `GET /peers/{peer}/context?max_conclusions=…&search_query=…` call (the server curates the representation around the current message; measured 17 268 → 1 319 chars). The session summary comes from `GET /sessions/{id}/summaries` — `/context?summary=true` only returns one above an undocumented token budget. The `semantic-recall` section read a `search_results` field that `SessionContext` does not define and could never appear; it is gone.
+- **Fix: the injection budget dropped content.** `_assembleByPriority()` let the first part consume the whole budget, and the peer card alone is ~5 000 chars at a 4 000 char ceiling, so the summary and every observation were silently cut. Replaced by `_assembleWithReserves()` with guaranteed shares and line-boundary truncation; `injectionMaxChars` default 4 000 → 12 000.
+- **Fix: timestamps were shifted by a hardcoded +8 h**, dating observations in the future for a CET host. They now render in local time.
+- **Fix: failures were invisible.** Requests returned `null` instead of throwing, and errors went to `console.error` only — the stdout of whatever process hosts DSH. Failures now go to `ctx.logger` and to an append-only `~/.dsh/logs/honcho-sync.log` (1 MB rotation), and error text no longer leaks into the prompt.
+- **Fix: one failed fetch disabled memory for the whole session.** The `injected` marker was set before the await. It is now set after success, retried up to `injectionRetries` times, guarded by an in-flight flag (two events of one session previously raced into `prompt context "honcho:memory" is already registered`), and an already-registered context counts as success.
+- **Fix: `settings.register()` no longer exists in DSH.** The settings wiring threw `settingsCtx.settings.register is not a function` on every load. Replaced by an exported `Config` schema with `.volatile()` fields, so the knobs appear in the settings panel and apply without a restart. When `@deepseek-ai/schemastery` cannot be resolved the plugin keeps working without a form instead of failing to load.
+- **Fix: a broken `honchoUrl` surfaced as an opaque `TypeError` at the first request.** It is validated at load (`new URL()`, http/https, non-empty workspace) and `apply()` refuses to start with a precise message.
+- **Fix: a dead Honcho server was only visible in the terminal.** A `/health` preflight at load now fails `apply()` (the fiber is marked failed, DSH keeps running) and names the exact URL. Disable with `preflight: false`.
+- **Also fixed:** `honcho_recall` validated `args.query` and iterated the conclusions response correctly (the server returns a bare array); tools register through the injected `tools` service so a reload no longer drops them.
+
 ### v0.8.0 → v0.8.1 changelog
 
 - **Context efficiency**: Reduced registered tools from 25 to 4 (`honcho_recall`, `honcho_ask`, `honcho_remember`, `honcho_context`) — saves ~7K tokens of tool schema injection per session
@@ -123,7 +136,35 @@ systemctl --user restart dsh-web
 | `HONCHO_USER_PEER` | Peer ID representing the user | `user` |
 | `HONCHO_AGENT_PEER` | Peer ID representing the agent | `agent` |
 
-> **Note:** Advanced options (debounce, recall budget, timeouts) use sensible defaults and rarely need tuning. If you do need to customize them, edit the `DEFAULTS` object at the top of `src/index.mjs`.
+> **Note:** Advanced options (debounce, recall budget, timeouts) use sensible defaults and rarely need tuning. When the plugin exports a `Config` schema (DSH with `@deepseek-ai/schemastery` resolvable), every key below also appears in the DSH settings panel and applies without restarting.
+
+#### Recall and sync keys
+
+Set these in the profile entry (`cordis.patch.yml`) or the settings panel:
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `honchoUrl` | Honcho base URL (overrides `HONCHO_URL`) | — |
+| `workspace` / `userPeer` / `agentPeer` | Workspace and peer ids | — / `user` / `agent` |
+| `autoRecall` / `autoSync` | Inject memory at session start / upload turns | `true` / `true` |
+| `preflight` | Probe `GET /health` at load and fail loudly when it answers badly | `true` |
+| `preflightTimeoutMs` | Preflight deadline | `3000` |
+| `injectionMaxChars` | Hard ceiling for one injected block | `12000` |
+| `summaryMaxChars` | Cap for the session summary | `4000` |
+| `searchTopK` | Semantic conclusions pulled per peer | `5` |
+| `searchMaxDistance` | Maximum semantic distance, lower is stricter | `0.7` |
+| `maxConclusionsUser` / `maxConclusionsAgent` | Representation size per peer (the server-side size lever) | `12` / `8` |
+| `includeMostFrequent` | Add the most frequent conclusions | `true` |
+| `reprMaxObs` | Observation blocks kept per peer | `20` |
+| `messageMaxChars` | Per-message upload cap | `25000` |
+| `debounceMs` | Sync debounce | `3000` |
+| `injectionRetries` | Injection attempts per session | `3` |
+
+#### Diagnostics
+
+Failures are written to `~/.dsh/logs/honcho-sync.log` (rotated at 1 MB) as well as `ctx.logger`, so a broken
+endpoint stays findable long after the console scrolled away. The sync cursor lives in
+`~/.dsh/honcho-sync-state.json`; a corrupt file is moved aside instead of silently restarting at zero.
 
 ### Honcho Server Setup
 
