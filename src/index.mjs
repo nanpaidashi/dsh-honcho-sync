@@ -47,12 +47,24 @@ import fs from 'node:fs';
  * @module @nanpaidashi/dsh-honcho-sync
  */
 
+// HONCHO-SYNC REWRITE (2026-11-22): lokales Änderungspaket, siehe
+// apply-dsh-honcho-fixes.ps1 (Fix 6-14) und
+// C:\Users\dkdk9\source\repos\hermes\DOKU-DSH-Honcho-Sync-Injection.md.
+// Dieser Marker ist der Idempotenz-Anker des Re-Apply-Skripts.
+
 const name = 'honcho-sync';
-const inject = [];
+// HONCHO-SYNC INJECT-FIX (2026-08-22): inject all consumed services (tools,
+// sessionQuery, systemPrompt) so apply() runs only after they are ready.
+const inject = ['tools', 'sessionQuery', 'systemPrompt'];
 
 // ─── Config helpers ────────────────────────────────────────────────────────
 
 // Extended defaults with local plugin knobs
+// HONCHO-SYNC TUNING (2026-11-22): the retrieval knobs and the injection budget
+// follow the official plastic-labs integrations (claude-honcho,
+// opencode-honcho): the server bounds the payload through
+// max_conclusions/search_top_k, and injectionMaxChars is only the last-resort
+// ceiling. Measured session-start payload for this account: 10.950 chars.
 const DEFAULTS = {
   honchoUrl: '',
   workspace: '',
@@ -64,140 +76,318 @@ const DEFAULTS = {
   recallBudget: 2000,
   autoSync: true,
   messageMaxChars: 25000,
-  injectionMaxChars: 4000, // P2 (2026-08-20): lowered from 8000 for quality-first injection
-  reprMaxObs: 4, // P2 (2026-08-20): lowered from 8 to reduce low-value observations
+  injectionMaxChars: 12000,
+  // A query-curated representation is a few hundred chars long, so keeping
+  // every block is cheap; the cap only guards an uncurated dump.
+  reprMaxObs: 20,
   reprTimeoutMs: 8000,
   cardTimeoutMs: 5000,
+  searchTopK: 5,
+  searchMaxDistance: 0.7,
+  maxConclusionsUser: 12,
+  maxConclusionsAgent: 8,
+  includeMostFrequent: true,
+  summaryMaxChars: 4000,
+  summaryTimeoutMs: 8000,
+  // Failure behaviour: fail loudly instead of silently returning null, and
+  // retry an injection that failed on an earlier turn of the same session.
+  preflight: true,
+  preflightTimeoutMs: 3000,
+  injectionRetries: 3,
+  errorLogMaxBytes: 1048576,
 };
 
 let _resolvedSettings = null; // Set by settings panel via scope.watch
 
+// ─── Settings schema (DSH settings panel) ─────────────────────────────────
+
+// HONCHO-SYNC CONFIG-SCHEMA (2026-11-22): DSH derives its settings form from
+// the plugin's exported Config schema; without one the plugin has no panel page
+// (the previous code called settings.register(), an API this DSH version no
+// longer has). schemastery ships inside the DSH installation and is reachable
+// from this package through a single link in the profile. When that link is
+// missing, the plugin keeps working without a form instead of failing to load.
+let Config;
+try {
+  const { default: z } = await import('@deepseek-ai/schemastery');
+  Config = z.object({
+    honchoUrl: z.string().description('Honcho base URL, e.g. http://host:8123').volatile(),
+    workspace: z.string().description('Honcho workspace name').volatile(),
+    userPeer: z.string().default('user').description('Peer that represents you').volatile(),
+    agentPeer: z.string().default('agent').description('Peer that represents the agent').volatile(),
+    autoRecall: z.boolean().default(true).description('Inject memory at session start').volatile(),
+    autoSync: z.boolean().default(true).description('Upload new turns to Honcho').volatile(),
+    preflight: z.boolean().default(true).description('Check /health at load and refuse to start when it fails').volatile(),
+    preflightTimeoutMs: z.number().step(1).min(100).default(3000).description('Preflight deadline in ms').volatile(),
+    injectionMaxChars: z.number().step(1).min(500).default(12000).description('Hard ceiling for one injected block').volatile(),
+    summaryMaxChars: z.number().step(1).min(200).default(4000).description('Cap for the session summary').volatile(),
+    searchTopK: z.number().step(1).min(1).max(100).default(5).description('Semantic conclusions pulled per peer').volatile(),
+    searchMaxDistance: z.number().min(0).max(1).default(0.7).description('Maximum semantic distance (lower is stricter)').volatile(),
+    maxConclusionsUser: z.number().step(1).min(1).max(100).default(12).description('Representation size for the user peer').volatile(),
+    maxConclusionsAgent: z.number().step(1).min(1).max(100).default(8).description('Representation size for the agent peer').volatile(),
+    includeMostFrequent: z.boolean().default(true).description('Add the most frequent conclusions').volatile(),
+    reprMaxObs: z.number().step(1).min(1).default(20).description('Observation blocks kept per peer').volatile(),
+    messageMaxChars: z.number().step(1).min(1000).default(25000).description('Per-message upload cap').volatile(),
+    debounceMs: z.number().step(1).min(100).default(3000).description('Sync debounce in ms').volatile(),
+    injectionRetries: z.number().step(1).min(0).max(10).default(3).description('Injection attempts per session').volatile(),
+  }).description('Honcho memory bridge: session-start recall and turn sync');
+} catch (error) {
+  console.warn(`[honcho-sync] settings form unavailable (no @deepseek-ai/schemastery): ${error?.message ?? error}`);
+}
+
+/**
+ * Unwrap a schemastery volatile value.
+ * HONCHO-SYNC VOLATILE-FIX (2026-11-22): a `.volatile()` config field does not
+ * arrive as a plain value but as `{ get() }`. Reading it directly yields an
+ * object, and `Number(object)` is NaN — which would silently poison every budget
+ * computation. Unwrap both shapes so the plugin works with or without a schema.
+ */
+function _unwrap(value) {
+  if (value !== null && typeof value === 'object' && typeof value.get === 'function') {
+    try { return value.get(); } catch { return undefined; }
+  }
+  return value;
+}
+
+/** First non-empty string among the candidates, unwrapping volatile values. */
+function _pickString(...candidates) {
+  for (const candidate of candidates) {
+    const value = _unwrap(candidate);
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return '';
+}
+
+/** Read one knob: resolved settings first, then the profile config, then the default. */
+function _pick(resolvedSettings, config, key) {
+  const value = _unwrap(resolvedSettings?.[key] ?? config?.[key]);
+  if (value === undefined || value === null) return DEFAULTS[key];
+  if (typeof DEFAULTS[key] === 'number') {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : DEFAULTS[key];
+  }
+  if (typeof DEFAULTS[key] === 'boolean') return typeof value === 'boolean' ? value : Boolean(value);
+  return value;
+}
+
 function getConfig(config, resolvedSettings) {
-  const url = (resolvedSettings?.honchoUrl || config?.honchoUrl || process.env.HONCHO_URL || '').replace(/\/$/, '');
+  const url = _pickString(resolvedSettings?.honchoUrl, config?.honchoUrl, process.env.HONCHO_URL).replace(/\/$/, '');
+  const tuning = {
+    debounceMs: _pick(resolvedSettings, config, 'debounceMs'),
+    recallBudget: _pick(resolvedSettings, config, 'recallBudget'),
+    messageMaxChars: _pick(resolvedSettings, config, 'messageMaxChars'),
+    injectionMaxChars: _pick(resolvedSettings, config, 'injectionMaxChars'),
+    reprMaxObs: _pick(resolvedSettings, config, 'reprMaxObs'),
+    reprTimeoutMs: _pick(resolvedSettings, config, 'reprTimeoutMs'),
+    cardTimeoutMs: _pick(resolvedSettings, config, 'cardTimeoutMs'),
+    searchTopK: _pick(resolvedSettings, config, 'searchTopK'),
+    searchMaxDistance: _pick(resolvedSettings, config, 'searchMaxDistance'),
+    maxConclusionsUser: _pick(resolvedSettings, config, 'maxConclusionsUser'),
+    maxConclusionsAgent: _pick(resolvedSettings, config, 'maxConclusionsAgent'),
+    includeMostFrequent: _pick(resolvedSettings, config, 'includeMostFrequent'),
+    summaryMaxChars: _pick(resolvedSettings, config, 'summaryMaxChars'),
+    summaryTimeoutMs: _pick(resolvedSettings, config, 'summaryTimeoutMs'),
+    preflight: _pick(resolvedSettings, config, 'preflight'),
+    preflightTimeoutMs: _pick(resolvedSettings, config, 'preflightTimeoutMs'),
+    injectionRetries: _pick(resolvedSettings, config, 'injectionRetries'),
+    errorLogMaxBytes: _pick(resolvedSettings, config, 'errorLogMaxBytes'),
+  };
+  const peers = {
+    workspace: _pickString(resolvedSettings?.workspace, config?.workspace, process.env.HONCHO_WORKSPACE),
+    userPeer: _pickString(resolvedSettings?.userPeer, config?.userPeer, process.env.HONCHO_USER_PEER) || 'user',
+    agentPeer: _pickString(resolvedSettings?.agentPeer, config?.agentPeer, process.env.HONCHO_AGENT_PEER) || 'agent',
+  };
+  const disabled = (configError) => ({
+    honchoUrl: url,
+    ...peers,
+    ...tuning,
+    autoRecall: false,
+    autoSync: false,
+    configError,
+  });
+  // HONCHO-SYNC CONFIG-FIX (2026-11-22): a broken honchoUrl used to surface as
+  // `TypeError: Failed to parse URL from <garbage>` at the first request, long
+  // after load. Validate here so apply() can refuse to start with a precise
+  // message instead of failing somewhere downstream.
   if (!url) {
-    console.error('[honcho-sync] HONCHO_URL is required. Set it via environment variable or the settings panel.');
-    // Return a safe default config with Honcho features disabled.
-    // This prevents cfg === null crashes while allowing DSH to start cleanly.
-    return {
-      honchoUrl: '',
-      workspace: resolvedSettings?.workspace || config?.workspace || process.env.HONCHO_WORKSPACE || '',
-      userPeer: resolvedSettings?.userPeer || config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
-      agentPeer: resolvedSettings?.agentPeer || config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
-      debounceMs: resolvedSettings?.debounceMs ?? config?.debounceMs ?? DEFAULTS.debounceMs,
-      autoRecall: false,  // disabled without URL
-      recallBudget: resolvedSettings?.recallBudget ?? config?.recallBudget ?? DEFAULTS.recallBudget,
-      autoSync: false,    // disabled without URL
-      messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? DEFAULTS.messageMaxChars,
-      injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? DEFAULTS.injectionMaxChars,
-      reprMaxObs: resolvedSettings?.reprMaxObs ?? config?.reprMaxObs ?? DEFAULTS.reprMaxObs,
-      reprTimeoutMs: resolvedSettings?.reprTimeoutMs ?? config?.reprTimeoutMs ?? DEFAULTS.reprTimeoutMs,
-      cardTimeoutMs: resolvedSettings?.cardTimeoutMs ?? config?.cardTimeoutMs ?? DEFAULTS.cardTimeoutMs,
-    };
+    return disabled('honchoUrl is not configured. Set honchoUrl in the profile patch (cordis.patch.yml) or the HONCHO_URL environment variable.');
+  }
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return disabled(`honchoUrl is not a valid absolute URL: ${JSON.stringify(url)}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return disabled(`honchoUrl must use http or https, got ${JSON.stringify(parsed.protocol)}`);
+  }
+  if (!peers.workspace) {
+    return disabled('workspace is not configured. Set workspace in the profile patch (cordis.patch.yml) or the HONCHO_WORKSPACE environment variable.');
   }
   return {
     honchoUrl: url,
-    workspace: resolvedSettings?.workspace || config?.workspace || process.env.HONCHO_WORKSPACE || '',
-    userPeer: resolvedSettings?.userPeer || config?.userPeer || process.env.HONCHO_USER_PEER || 'user',
-    agentPeer: resolvedSettings?.agentPeer || config?.agentPeer || process.env.HONCHO_AGENT_PEER || 'agent',
-    debounceMs: resolvedSettings?.debounceMs ?? config?.debounceMs ?? 3000,
-    autoRecall: resolvedSettings?.autoRecall ?? config?.autoRecall ?? true,
-    recallBudget: resolvedSettings?.recallBudget ?? config?.recallBudget ?? 2000,
-    autoSync: resolvedSettings?.autoSync ?? config?.autoSync ?? true,
-    messageMaxChars: resolvedSettings?.messageMaxChars ?? config?.messageMaxChars ?? 25000,
-    injectionMaxChars: resolvedSettings?.injectionMaxChars ?? config?.injectionMaxChars ?? DEFAULTS.injectionMaxChars,
-    reprMaxObs: resolvedSettings?.reprMaxObs ?? config?.reprMaxObs ?? DEFAULTS.reprMaxObs,
-    reprTimeoutMs: resolvedSettings?.reprTimeoutMs ?? config?.reprTimeoutMs ?? DEFAULTS.reprTimeoutMs,
-    cardTimeoutMs: resolvedSettings?.cardTimeoutMs ?? config?.cardTimeoutMs ?? DEFAULTS.cardTimeoutMs,
+    ...peers,
+    ...tuning,
+    autoRecall: _pick(resolvedSettings, config, 'autoRecall'),
+    autoSync: _pick(resolvedSettings, config, 'autoSync'),
   };
+}
+
+// ─── Failure reporting ─────────────────────────────────────────────────────
+
+// HONCHO-SYNC LOUD-FAIL (2026-11-22): failures used to reach `console.error`
+// only — the stdout of whatever process hosts DSH — so a permanent breakage was
+// invisible unless someone happened to read the terminal. Every warning and
+// error now also goes to ctx.logger (which DSH names per plugin) and to an
+// append-only file, so a failure stays findable days later.
+let _pluginCtx = null;
+
+/** Absolute path of the append-only plugin error log. */
+function _errorLogPath() {
+  return path.join(process.env.HOME || process.env.USERPROFILE || '/root', '.dsh', 'logs', 'honcho-sync.log');
+}
+
+/** Append one line to the plugin error log, rotating at the configured size. */
+function _appendErrorLog(line) {
+  const logPath = _errorLogPath();
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    try {
+      const limit = DEFAULTS.errorLogMaxBytes;
+      if (fs.statSync(logPath).size > limit) fs.renameSync(logPath, `${logPath}.1`);
+    } catch (e) {
+      if (e?.code !== 'ENOENT') throw e; // No previous log is the normal first write.
+    }
+    fs.appendFileSync(logPath, `${line}\n`, 'utf8');
+  } catch (e) {
+    console.error(`[honcho-sync] cannot write ${logPath}: ${e.message}`);
+  }
+}
+
+/**
+ * Report a plugin failure through every available channel.
+ * @param level - logger severity; `warn` and `error` are persisted to disk.
+ * @param message - complete, self-contained description (include the URL or peer).
+ */
+function _honchoLog(level, message) {
+  try {
+    if (_pluginCtx?.logger) _pluginCtx.logger('honcho-sync')[level](message);
+    else console[level === 'debug' ? 'log' : level](`[honcho-sync] ${message}`);
+  } catch {
+    // The logger itself is unavailable (early boot): keep the message on stderr.
+    console.error(`[honcho-sync] ${message}`);
+  }
+  if (level === 'warn' || level === 'error') {
+    _appendErrorLog(`${new Date().toISOString()} ${level.toUpperCase()} ${message}`);
+  }
 }
 
 // ─── Persistence (debounce state survives DSH restart) ─────────────────────
 
-const PERSIST_FILE = path.join(process.env.HOME || '/root', '.dsh', 'honcho-sync-state.json');
+// USERPROFILE fallback: HOME is usually unset on Windows, which silently broke
+// sync-cursor persistence (duplicate syncs after a restart).
+const PERSIST_FILE = path.join(process.env.HOME || process.env.USERPROFILE || '/root', '.dsh', 'honcho-sync-state.json');
 function loadState() {
-  try { const d = fs.readFileSync(PERSIST_FILE, 'utf8'); return JSON.parse(d); } catch { return {}; }
+  let raw;
+  try {
+    raw = fs.readFileSync(PERSIST_FILE, 'utf8');
+  } catch (e) {
+    if (e?.code === 'ENOENT') return {};
+    _honchoLog('error', `cannot read sync state ${PERSIST_FILE}: ${e.message}`);
+    throw e;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    // Never fall back to `{}`: that silently re-syncs every session from zero.
+    const aside = `${PERSIST_FILE}.corrupt-${Date.now()}`;
+    try { fs.renameSync(PERSIST_FILE, aside); } catch (moveError) {
+      _honchoLog('error', `sync state ${PERSIST_FILE} is corrupt and cannot be moved aside: ${moveError.message}`);
+      throw e;
+    }
+    _honchoLog('error', `sync state ${PERSIST_FILE} is corrupt (${e.message}); moved to ${aside}, next sync starts at 0`);
+    return {};
+  }
 }
 function saveState(s) {
-  try { fs.writeFileSync(PERSIST_FILE, JSON.stringify(s), 'utf8'); } catch {}
+  try {
+    fs.writeFileSync(PERSIST_FILE, JSON.stringify(s), 'utf8');
+  } catch (e) {
+    // Losing the cursor re-syncs whole sessions on the next start: must be loud.
+    _honchoLog('error', `cannot write sync state ${PERSIST_FILE}: ${e.message}`);
+    throw e;
+  }
 }
 
 // ─── Main plugin ───────────────────────────────────────────────────────────
 
-function apply(ctx, config) {
+async function apply(ctx, config) {
+  _pluginCtx = ctx;
   const sessionQuery = ctx.get('sessionQuery');
   const systemPrompt = ctx.get('systemPrompt');
 
-  // ─── Settings namespace wiring (GitHub upstream) ──────────────────────
-
-  const HONCHO_NS = 'honcho-memory';
-
-  ctx.inject(['settings'], (settingsCtx) => {
-    const scope = settingsCtx.settings.register(
-      HONCHO_NS,
-      {
-        type: 'object',
-        properties: {
-          honchoUrl: { type: 'string', default: '' },
-          workspace: { type: 'string', default: '' },
-          userPeer: { type: 'string', default: 'user' },
-          agentPeer: { type: 'string', default: 'agent' },
-          sessionStrategy: { type: 'string', default: 'per-directory' },
-          debounceMs: { type: 'integer', default: 3000 },
-          autoRecall: { type: 'boolean', default: true },
-          recallBudget: { type: 'integer', default: 2000 },
-          autoSync: { type: 'boolean', default: true },
-          messageMaxChars: { type: 'integer', default: 25000 },
-          injectionMaxChars: { type: 'integer', default: 8000 },
-          reprMaxObs: { type: 'integer', default: 8 },
-          reprTimeoutMs: { type: 'integer', default: 8000 },
-          cardTimeoutMs: { type: 'integer', default: 5000 },
-        },
-        required: [],
-      },
-      { base: config || {}, validate: (v) => {
-        if (v.debounceMs !== undefined && v.debounceMs < 100) throw new Error('debounce must be >= 100ms');
-        if (v.recallBudget !== undefined && v.recallBudget < 1) throw new Error('recall budget must be >= 1');
-      }}
-    );
-    resolvedSettings = { ...DEFAULTS, ...(config || {}), ...scope.get() };
-
-    const unwatch = scope.watch(() => {
-      resolvedSettings = { ...DEFAULTS, ...(config || {}), ...scope.get() };
-    });
-    settingsCtx.effect(() => unwatch);
-  });
-
+  // HONCHO-SYNC SETTINGS-FIX (2026-11-22): the previous settings namespace
+  // wiring called settingsCtx.settings.register(), which does not exist in this
+  // DSH version — it threw `settingsCtx.settings.register is not a function` on
+  // every load, so the block never took effect and only produced a startup
+  // error. DSH derives settings forms from a plugin's exported Config schema,
+  // which this plain .mjs plugin cannot provide without importing schemastery
+  // from a profile install whose junction currently dangles. The knobs below
+  // live in cordis.patch.yml and take effect on the next load.
   let resolvedSettings = { ...DEFAULTS, ...(config || {}) };
-  const cfg = getConfig(config, resolvedSettings);
+  /** Live view of the effective configuration. Never cache this across awaits. */
+  const cfg = () => getConfig(config, resolvedSettings);
   const state = new Map();
+
+  // Refuse to start on an unusable configuration instead of degrading into
+  // silent no-ops: the fiber fails loudly, DSH itself keeps running.
+  const initial = cfg();
+  if (initial.configError) throw new Error(`honcho-sync: ${initial.configError}`);
 
   // ─── Honcho API helpers ────────────────────────────────────────────────
 
+  /**
+   * Call the Honcho API.
+   * @param method - HTTP method.
+   * @param path - path **relative** to honchoUrl, always starting with `/`.
+   * @param body - JSON body; omitted for GET and DELETE.
+   * @param timeoutMs - abort deadline for this request.
+   * @returns the parsed JSON response, or the response text for non-JSON replies.
+   * @throws when the path is not relative, the request fails, or the server
+   * returns a non-2xx status. Callers decide whether the failure is fatal.
+   */
   async function honchoRequest(method, path, body, timeoutMs = 15000) {
-    if (!cfg) return null;
-    const url = `${cfg.honchoUrl}${path}`;
+    const c = cfg();
+    if (!c.honchoUrl) throw new Error('honcho-sync: honchoUrl is not configured');
+    // HONCHO-SYNC URL-GUARD (2026-11-22): a path that already carries the base
+    // URL produced `TypeError: Failed to parse URL from <url><url>` and was
+    // silently swallowed here. Refuse it with a message that names the culprit.
+    if (typeof path !== 'string' || !path.startsWith('/')) {
+      throw new Error(`honcho-sync: honchoRequest path must be relative and start with "/", got ${JSON.stringify(path)}`);
+    }
+    const url = `${c.honchoUrl}${path}`;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     const opts = { method, headers: { 'Content-Type': 'application/json' }, signal: ctrl.signal };
     if (body !== undefined) opts.body = JSON.stringify(body);
+    else if (method !== 'GET' && method !== 'DELETE') opts.body = '{}';
     try {
       const resp = await fetch(url, opts);
       if (!resp.ok) {
         const text = await resp.text().catch(() => '');
-        throw new Error(`Honcho ${method} ${path}: ${resp.status} ${text.slice(0, 200)}`);
+        throw new Error(`Honcho ${method} ${url} -> ${resp.status} ${resp.statusText} ${text.slice(0, 200)}`.trim());
       }
       const ct = resp.headers.get('content-type') || '';
       if (ct.includes('json')) return await resp.json();
       return await resp.text();
     } catch (e) {
-      if (e.name === 'AbortError') {
-        console.error(`[honcho-sync] API timeout: ${method} ${path}`);
-        return null;
-      }
-      console.error(`[honcho-sync] API error: ${e.message}`);
-      return null;
+      const message = e?.name === 'AbortError'
+        ? `Honcho ${method} ${url} timed out after ${timeoutMs}ms`
+        : (e?.message ?? String(e));
+      _honchoLog('error', message);
+      throw new Error(message);
     } finally {
-      clearTimeout(t);
+      clearTimeout(timer);
     }
   }
 
@@ -259,9 +449,11 @@ function apply(ctx, config) {
     const converted = deduped.map(b => {
       const m = b.match(/^\[(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\]/);
       if (m) {
+        // HONCHO-SYNC TIMESTAMP-FIX (2026-11-22): the old code shifted every
+        // timestamp by a hardcoded +8h (CST), which silently dated observations
+        // in the future for a CET host. Honcho reports UTC; render local time.
         const date = new Date(m[1] + 'T' + m[2] + 'Z');
-        date.setHours(date.getHours() + 8);
-        const ts = date.toISOString().replace('T', ' ').replace('Z', '').slice(0, 19);
+        const ts = date.toLocaleString('sv-SE').slice(0, 19);
         return '[' + ts + '] ' + b.slice(m[0].length).trimStart();
       }
       return b;
@@ -420,37 +612,46 @@ function apply(ctx, config) {
   }
 
   /**
-   * P2 (2026-08-20): Assemble parts by priority.
-   * Priority order: peer-card > session-summary > semantic-recall > representation
-   * Each part must have at least 50% of its content to be included.
+   * HONCHO-SYNC BUDGET-FIX (2026-11-22): assemble the injected parts under a
+   * character ceiling.
+   *
+   * The previous greedy walk let the first part consume the whole budget, so a
+   * peer card larger than the ceiling silently dropped the summary and every
+   * observation. Each part now gets a reserved share first, and whatever is
+   * left over is handed to the parts that are still truncated, in priority
+   * order.
+   * @param parts - keyed payload sections; absent keys are skipped.
+   * @param maxChars - total ceiling for the assembled body.
+   * @returns the joined body, never longer than maxChars plus a truncation marker.
    */
-  function _assembleByPriority(parts, maxChars) {
-    const priorityOrder = [
-      'peer-card',
-      'session-summary',
-      'semantic-recall',
-      'representation'
-    ];
+  function _assembleWithReserves(parts, maxChars) {
+    const layout = [
+      { key: 'peer-context', share: 0.45 },
+      { key: 'session-summary', share: 0.25 },
+    ].filter((entry) => parts[entry.key]);
+    if (layout.length === 0) return '';
 
-    const sorted = priorityOrder.map(key => ({
-      key,
-      text: parts[key] || ''
-    })).filter(p => p.text);
-
+    const allocation = new Map();
     let budget = maxChars;
-    const kept = [];
-
-    for (const part of sorted) {
-      if (budget <= 0) break;
-
-      const available = Math.min(part.text.length, budget);
-      if (available >= part.text.length * 0.5) {
-        kept.push(part.text.slice(0, available));
-        budget -= available;
-      }
+    for (const { key, share } of layout) {
+      const wanted = Math.min(parts[key].length, Math.floor(maxChars * share));
+      const granted = Math.min(wanted, budget);
+      allocation.set(key, granted);
+      budget -= granted;
     }
-
-    return kept.join('\n\n');
+    for (const { key } of layout) {
+      if (budget <= 0) break;
+      const granted = allocation.get(key);
+      const missing = parts[key].length - granted;
+      if (missing <= 0) continue;
+      const extra = Math.min(missing, budget);
+      allocation.set(key, granted + extra);
+      budget -= extra;
+    }
+    return layout
+      .map(({ key }) => _clampLines(parts[key], allocation.get(key)))
+      .filter(Boolean)
+      .join('\n\n');
   }
 
   // ─── Memory tools ──────────────────────────────────────────────────────
@@ -464,27 +665,93 @@ function apply(ctx, config) {
         limit: { type: 'integer', description: 'Number of results to return per source. Default 5, max 10.' },
       },
       async execute(args, exec) {
-        const n = Math.min(Math.max(args.limit || 5, 1), 10);
+        const n = Math.min(Math.max(args?.limit || 5, 1), 10);
         const cwd = exec?.agent?.session?.header?.cwd || '';
-        const base = `/v3/workspaces/${cfg.workspace}`;
+        const base = `/v3/workspaces/${cfg().workspace}`;
+
+        // HONCHO-SYNC FIX (2026-08-22): normalize/validate the query before
+        // sending. The model sometimes omits args (DSH parseArguments -> {}) or
+        // passes a non-string; the server then answers 422 on BOTH /search and
+        // /conclusions/query, which honchoRequest maps to null -> misleading
+        // "server error or timeout".
+        const raw = args?.query;
+        const query = typeof raw === 'string' ? raw.trim() : (raw == null ? '' : String(raw).trim());
+        if (!query) {
+          return {
+            ok: true,
+            tool: 'honcho_recall',
+            results: ['honcho_recall requires a non-empty string "query" with the search terms.'],
+            count: 1,
+          };
+        }
 
         // P1 (2026-08-20): hybrid recall — messages AND conclusions in parallel.
         // Conclusions are the reasoned layer (explicit/deductive/inductive);
         // messages alone miss everything the Deriver/Dreamer has inferred.
-        const [msgResult, conclResult] = await Promise.all([
+        // HONCHO-SYNC LOUD-FAIL (2026-11-22): allSettled so one failing source
+        // still returns the other's hits, and the failure is named in the result
+        // the model sees instead of being swallowed.
+        const [msgOutcome, conclOutcome] = await Promise.allSettled([
           honchoRequest('POST', `${base}/search`,
-            { query: args.query, limit: n, max_tokens: 2000 },
+            { query, limit: n, max_tokens: 2000 },
             30000
           ),
           honchoRequest('POST', `${base}/conclusions/query`,
-            { query: args.query, limit: n, max_distance: 0.85, filters: { observer: cfg.agentPeer, observed: cfg.userPeer } },
+            { query, limit: n, max_distance: 0.85, filters: { observer: cfg().agentPeer, observed: cfg().userPeer } },
             30000
           ),
         ]);
+        const msgResult = msgOutcome.status === 'fulfilled' ? msgOutcome.value : null;
+        const conclResult = conclOutcome.status === 'fulfilled' ? conclOutcome.value : null;
+        const sourceErrors = [];
+        if (msgOutcome.status === 'rejected') sourceErrors.push(`search: ${msgOutcome.reason?.message ?? msgOutcome.reason}`);
+        if (conclOutcome.status === 'rejected') sourceErrors.push(`conclusions: ${conclOutcome.reason?.message ?? conclOutcome.reason}`);
+
+        // HONCHO-SYNC FALLBACK (2026-08-23): natural-language German questions
+        // ("welche Bewerbungen wurden am 21. und 22. August versendet") rank
+        // poorly against the english-oriented semantic stack, so when the first
+        // search yields few/no hits we retry with a stopword-stripped phrase.
+        // Combined results are deduped and sorted newest-first, which puts the
+        // Telegram application messages (21./22.08) on top.
+        const STOPWORDS = new Set([
+          'der','die','das','den','dem','des','ein','eine','einer','einem','einen','eines',
+          'und','oder','aber','am','um','im','in','an','auf','fuer','von','zu','mit','ueber',
+          'nach','bei','aus','auch','noch','nicht','kein','keine','kann','koennen','wurde',
+          'wurden','werden','wird','hat','haben','ist','sind','war','waren','welche','welcher',
+          'welchem','welches','wie','was','wer','wo','wann','warum','denn','dann','dass','diese',
+          'dieser','diesem','the','a','an','of','to','in','on','for','and','or','is','are','was',
+          'were','have','has','had','be','by','with','from','at','as','it','this','that','these',
+          'those','please','list','show','make','me','all','my','hier','bitte','auf','ueber',
+        ]);
+        const cleanedQuery = query
+          .split(/\s+/)
+          .map((t) => t.replace(/[.,!?;:"'()]/g, ''))
+          .filter((t) => t.length > 2 && !STOPWORDS.has(t.toLowerCase()))
+          .join(' ')
+          .trim();
 
         const results = [];
         // /search returns a bare array (not {results: []})
-        const msgArr = Array.isArray(msgResult) ? msgResult : (msgResult?.results || []);
+        let msgArr = Array.isArray(msgResult) ? msgResult : (msgResult?.results || []);
+        if (msgArr.length < 2 && cleanedQuery && cleanedQuery !== query) {
+          const fbResult = await honchoRequest('POST', `${base}/search`,
+            { query: cleanedQuery, limit: n, max_tokens: 2000 },
+            30000
+          );
+          const fbArr = Array.isArray(fbResult) ? fbResult : (fbResult?.results || []);
+          if (fbArr.length > 0) {
+            const seen = new Set(msgArr.map((m) => m.id || m.content));
+            for (const m of fbArr) {
+              const key = m.id || m.content;
+              if (!seen.has(key)) { seen.add(key); msgArr.push(m); }
+            }
+          }
+        }
+        if (msgArr.length > 0) {
+          msgArr = [...msgArr].sort((a, b) =>
+            String(b.created_at || '').localeCompare(String(a.created_at || ''))
+          ).slice(0, n);
+        }
         if (msgArr.length > 0) {
           for (const r of msgArr) {
             const content = (r.content || '').slice(0, 400);
@@ -493,20 +760,26 @@ function apply(ctx, config) {
             results.push(`[message ${peer} ${ts}] ${content}`);
           }
         } else if (!msgResult) {
-          results.push('[message search failed — server error or timeout]');
+          results.push('[message search failed — honcho server error or timeout (see ~/.dsh/logs/honcho-sync.log)]');
         }
         // /conclusions/query returns bare array or {results: []}
         const conclArr = Array.isArray(conclResult) ? conclResult : (conclResult?.results || []);
         if (conclArr.length > 0) {
-          for (const r of conclResult.results) {
+          // HONCHO-SYNC FIX (2026-08-22): iterate conclArr. The server returns a
+          // bare array, so `conclResult.results` is undefined and threw
+          // TypeError: conclResult.results is not iterable.
+          for (const r of conclArr) {
             const text = (r.conclusion || r.content || '').slice(0, 400);
-            const type = r.conclusion_type || 'unknown';
+            const type = r.level || r.conclusion_type || 'unknown';
             const conf = r.confidence != null ? ` conf=${Number(r.confidence).toFixed(2)}` : '';
-            const peer = r.peer_id || r.observer || '?';
+            const peer = r.peer_id || r.observer_id || r.observer || '?';
             results.push(`[conclusion:${type} ${peer}${conf}] ${text}`);
           }
         }
         if (results.length === 0) results.push('No results found in messages or conclusions.');
+        if (sourceErrors.length > 0) {
+          results.push(`[honcho-sync: ${sourceErrors.join(' | ')}]`);
+        }
         return { ok: true, tool: 'honcho_recall', results, count: results.length };
       },
     };
@@ -518,14 +791,14 @@ function apply(ctx, config) {
       description: 'Ask Honcho a question using dialectic reasoning. Takes 2-5 min. Use for deep questions: "what did we discuss about X".',
       parameters: {
         query: { type: 'string', required: true, description: 'The question to ask the memory system.' },
-        peer: { type: 'string', description: `Which peer to query. Default: ${cfg.userPeer}.` },
+        peer: { type: 'string', description: `Which peer to query. Default: ${cfg().userPeer}.` },
       },
       async execute(args, exec) {
-        const targetPeer = args.peer || cfg.userPeer;
+        const targetPeer = args.peer || cfg().userPeer;
         // P1 (2026-08-20): no date-window filter — sessions are long-lived per
         // directory, so the dialectic can reason over the full history.
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/peers/${targetPeer}/chat`,
+          `/v3/workspaces/${cfg().workspace}/peers/${targetPeer}/chat`,
           { query: args.query },
           300000 // 5 min cap for dialectic
         );
@@ -545,11 +818,11 @@ function apply(ctx, config) {
         peer_id: { type: 'string', description: 'Who said it (defaults to user peer).' },
       },
       async execute(args, exec) {
-        const peer = args.peer_id || cfg.userPeer;
+        const peer = args.peer_id || cfg().userPeer;
         const cwd = exec?.agent?.session?.header?.cwd || '';
         const sessionId = honchoSessionId(cwd);
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/sessions/${sessionId}/messages`,
+          `/v3/workspaces/${cfg().workspace}/sessions/${sessionId}/messages`,
           { messages: [{ role: 'user', content: args.content, peer_id: peer }] }
         );
         if (!result) return { ok: true, tool: 'honcho_remember', text: 'Error saving to Honcho.' };
@@ -571,7 +844,7 @@ function apply(ctx, config) {
         const sessionId = args.session_id || honchoSessionId(cwd);
         const tokens = args.tokens || 500;
         const result = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/sessions/${sessionId}/context?summary=true&tokens=${tokens}`
+          `/v3/workspaces/${cfg().workspace}/sessions/${sessionId}/context?summary=true&tokens=${tokens}`
         );
         if (!result) return { ok: true, tool: 'honcho_context', text: 'Error retrieving context.' };
         const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
@@ -593,7 +866,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/search`,
+          `/v3/workspaces/${cfg().workspace}/search`,
           { query: args.query, limit: args.limit || 10, max_tokens: args.max_tokens || 2000 }
         );
         if (!result) return { ok: true, tool: 'honcho_search', results: ['Error contacting Honcho server.'], count: 0 };
@@ -617,7 +890,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/search`,
+          `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/search`,
           { query: args.query, max_tokens: args.max_tokens || 500 }
         );
         if (!result) return { ok: true, tool: 'honcho_session_search', results: ['Error contacting Honcho server.'], count: 0 };
@@ -640,7 +913,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/peers/${args.peer_id}/card`
+          `/v3/workspaces/${cfg().workspace}/peers/${args.peer_id}/card`
         );
         if (!result) return { ok: true, tool: 'honcho_profile', card: [] };
         const card = Array.isArray(result.peer_card) ? result.peer_card : [];
@@ -658,7 +931,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/peers/${args.peer_id}/representation`,
+          `/v3/workspaces/${cfg().workspace}/peers/${args.peer_id}/representation`,
           {},
           15000
         );
@@ -680,7 +953,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/sessions/list`,
+          `/v3/workspaces/${cfg().workspace}/sessions/list`,
           { limit: args.limit || 20 }
         );
         if (!result) return { ok: true, tool: 'honcho_session', sessions: [] };
@@ -702,7 +975,7 @@ function apply(ctx, config) {
         const body = { id: args.session_id };
         if (args.metadata) body.metadata = args.metadata;
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/sessions`,
+          `/v3/workspaces/${cfg().workspace}/sessions`,
           body
         );
         if (!result) return { ok: false, tool: 'honcho_session_create', text: 'Error creating session.' };
@@ -721,7 +994,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/clone`,
+          `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/clone`,
           { id: args.new_id }
         );
         if (!result) return { ok: false, tool: 'honcho_session_clone', text: 'Error cloning session.' };
@@ -743,7 +1016,7 @@ function apply(ctx, config) {
         const action = args.action || 'list';
         if (action === 'list') {
           const result = await honchoRequest('GET',
-            `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/peers`
+            `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/peers`
           );
           if (!result) return { ok: true, tool: 'honcho_session_peers', peers: [] };
           const peers = Array.isArray(result) ? result : (result.items || []);
@@ -751,14 +1024,14 @@ function apply(ctx, config) {
         } else if (action === 'add') {
           if (!args.peer_id) return { ok: false, tool: 'honcho_session_peers', text: 'peer_id required for add.' };
           const result = await honchoRequest('POST',
-            `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/peers`,
+            `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/peers`,
             { peer_id: args.peer_id }
           );
           return { ok: !!result, tool: 'honcho_session_peers', text: `Added ${args.peer_id} to session.` };
         } else if (action === 'remove') {
           if (!args.peer_id) return { ok: false, tool: 'honcho_session_peers', text: 'peer_id required for remove.' };
           const result = await honchoRequest('DELETE',
-            `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/peers`,
+            `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/peers`,
             { peer_id: args.peer_id }
           );
           return { ok: !!result, tool: 'honcho_session_peers', text: `Removed ${args.peer_id} from session.` };
@@ -777,7 +1050,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/summaries`
+          `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/summaries`
         );
         if (!result) return { ok: true, tool: 'honcho_session_summaries', summaries: [] };
         // API returns a session object with short_summary, or an array of summaries
@@ -805,7 +1078,7 @@ function apply(ctx, config) {
         const sid = args.session_id || honchoSessionId('');
         const tokens = args.tokens || 500;
         const result = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/sessions/${sid}/context?summary=true&tokens=${tokens}`
+          `/v3/workspaces/${cfg().workspace}/sessions/${sid}/context?summary=true&tokens=${tokens}`
         );
         if (!result) return { ok: true, tool: 'honcho_session_context', text: 'Error retrieving context.' };
         const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
@@ -823,7 +1096,7 @@ function apply(ctx, config) {
       parameters: {},
       async execute() {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/peers/list`,
+          `/v3/workspaces/${cfg().workspace}/peers/list`,
           {}
         );
         if (!result) return { ok: true, tool: 'honcho_peer', peers: [] };
@@ -845,7 +1118,7 @@ function apply(ctx, config) {
         const body = { id: args.peer_id };
         if (args.name) body.name = args.name;
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/peers`,
+          `/v3/workspaces/${cfg().workspace}/peers`,
           body
         );
         if (!result) return { ok: false, tool: 'honcho_peer_create', text: 'Error creating peer.' };
@@ -861,7 +1134,7 @@ function apply(ctx, config) {
       parameters: {},
       async execute() {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/peers/list`,
+          `/v3/workspaces/${cfg().workspace}/peers/list`,
           {}
         );
         if (!result) return { ok: true, tool: 'honcho_peer_list', peers: [] };
@@ -887,12 +1160,12 @@ function apply(ctx, config) {
         const sid = args.session_id || honchoSessionId('');
         const cfg = getConfig(config, resolvedSettings);
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/sessions/${sid}/messages`,
+          `/v3/workspaces/${cfg().workspace}/sessions/${sid}/messages`,
           {
             messages: [{
               role: args.role || 'user',
               content: args.content,
-              peer_id: args.peer_id || (args.role === 'assistant' ? cfg.agentPeer : cfg.userPeer),
+              peer_id: args.peer_id || (args.role === 'assistant' ? cfg().agentPeer : cfg().userPeer),
             }],
           }
         );
@@ -912,7 +1185,7 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/sessions/${args.session_id}/messages/${args.message_id}`
+          `/v3/workspaces/${cfg().workspace}/sessions/${args.session_id}/messages/${args.message_id}`
         );
         if (!result) return { ok: true, tool: 'honcho_message_get', message: null };
         return { ok: true, tool: 'honcho_message_get', message: result };
@@ -931,11 +1204,11 @@ function apply(ctx, config) {
         peer_id: { type: 'string', description: 'Which peer this conclusion is about (default: user peer).' },
       },
       async execute(args) {
-        const peer = args.peer_id || cfg.userPeer;
+        const peer = args.peer_id || cfg().userPeer;
         // API expects { conclusions: [{ content, peer_id, observer_id }] }
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/conclusions`,
-          { conclusions: [{ content: args.content, peer_id: peer, observer_id: cfg.agentPeer, observed_id: peer }] }
+          `/v3/workspaces/${cfg().workspace}/conclusions`,
+          { conclusions: [{ content: args.content, peer_id: peer, observer_id: cfg().agentPeer, observed_id: peer }] }
         );
         if (!result) return { ok: false, tool: 'honcho_conclude', text: 'Error creating conclusion.' };
         const id = Array.isArray(result) ? result[0]?.id : (result.items?.[0]?.id || result.id);
@@ -956,7 +1229,7 @@ function apply(ctx, config) {
         const body = { limit: args.limit || 20 };
         if (args.peer_id) body.peer_id = args.peer_id;
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/conclusions/list`,
+          `/v3/workspaces/${cfg().workspace}/conclusions/list`,
           body
         );
         if (!result) return { ok: true, tool: 'honcho_conclude_list', conclusions: [] };
@@ -976,8 +1249,8 @@ function apply(ctx, config) {
       },
       async execute(args) {
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/conclusions/query`,
-          { query: args.query, limit: args.limit || 10, filters: { observer: cfg.agentPeer, observed: cfg.userPeer } }
+          `/v3/workspaces/${cfg().workspace}/conclusions/query`,
+          { query: args.query, limit: args.limit || 10, filters: { observer: cfg().agentPeer, observed: cfg().userPeer } }
         );
         if (!result) return { ok: true, tool: 'honcho_conclude_query', conclusions: [] };
         const conclusions = Array.isArray(result) ? result : (result.items || result.conclusions || []);
@@ -996,12 +1269,12 @@ function apply(ctx, config) {
       async execute() {
         const health = await honchoRequest('GET', '/health');
         const queue = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/queue/status`
+          `/v3/workspaces/${cfg().workspace}/queue/status`
         );
         return {
           ok: true,
           tool: 'honcho_status',
-          text: `Honcho: ${health?.status || 'unknown'} | Workspace: ${cfg.workspace || 'not set'} | URL: ${cfg.honchoUrl} | Queue: ${queue ? (queue.pending ?? '?') + ' pending' : 'n/a'}`,
+          text: `Honcho: ${health?.status || 'unknown'} | Workspace: ${cfg().workspace || 'not set'} | URL: ${cfg().honchoUrl} | Queue: ${queue ? (queue.pending ?? '?') + ' pending' : 'n/a'}`,
         };
       },
     };
@@ -1017,10 +1290,10 @@ function apply(ctx, config) {
         observed: { type: 'string', description: 'Observed peer (default: user peer).' },
       },
       async execute(args) {
-        const observer = args.observer || cfg.agentPeer;
-        const observed = args.observed || cfg.userPeer;
+        const observer = args.observer || cfg().agentPeer;
+        const observed = args.observed || cfg().userPeer;
         const result = await honchoRequest('POST',
-          `/v3/workspaces/${cfg.workspace}/schedule_dream`,
+          `/v3/workspaces/${cfg().workspace}/schedule_dream`,
           { dream_type: args.dream_type || 'card_refresh', observer, observed }
         );
         if (!result) return { ok: false, tool: 'honcho_dream', text: 'Error scheduling dream.' };
@@ -1036,7 +1309,7 @@ function apply(ctx, config) {
       parameters: {},
       async execute() {
         const result = await honchoRequest('GET',
-          `/v3/workspaces/${cfg.workspace}/queue/status`
+          `/v3/workspaces/${cfg().workspace}/queue/status`
         );
         if (!result) return { ok: true, tool: 'honcho_queue', text: 'Error fetching queue status.' };
         return { ok: true, tool: 'honcho_queue', text: JSON.stringify(result, null, 2).slice(0, 3000) };
@@ -1144,13 +1417,13 @@ function apply(ctx, config) {
       };
     }
 
-    ctx.effect(
-      () => {
-        const toolsReg = ctx.get('tools');
-        if (toolsReg !== undefined) toolsReg.register(tool);
-      },
-      'honcho-sync: ' + tool.name
-    );
+    // HONCHO-SYNC TOOL-REG FIX (2026-08-22): register directly via the injected
+    // `tools` service (inject: ['tools']) — the old ctx.effect + ctx.get('tools')
+    // guard silently skipped registration when the tools service resolved after
+    // the plugin's effect (tools vanished after a reload/recomposition).
+    // ctx.effect wraps the returned disposer so an unload/reload unregisters the
+    // tool cleanly instead of leaking a stale registration.
+    ctx.effect(() => ctx.tools.register(tool), 'honcho-sync: ' + tool.name);
   }
 
   // ─── Context injection on session start (Layer 1) ──────────────────────
@@ -1161,132 +1434,189 @@ function apply(ctx, config) {
   // semantically relevant to what the user is actually asking — the "brain
   // associative recall" step. Cards + representations still injected as the
   // stable declarative/procedural layer.
-  async function buildMemoryContext(honchoSid, searchQuery) {
-    const base = `${cfg.honchoUrl}/v3/workspaces/${cfg.workspace}`;
-    const parts = {}; // P2: use object with priority keys
-    const errors = [];
-
-    // Peer cards (GET, immediate).
-    const cards = {};
-    const cardParts = [];
-    for (const peer of [cfg.userPeer, cfg.agentPeer]) {
-      try {
-        const d = await honchoRequest('GET', `${base}/peers/${peer}/card`, undefined, cfg.cardTimeoutMs);
-        if (!d) { errors.push(`card:${peer}:timeout`); continue; }
-        const card = Array.isArray(d.peer_card) ? d.peer_card : [];
-        if (card.length > 0) {
-          cardParts.push(`[Peer Card: ${peer}]\n${card.join('\n')}`);
-        }
-        cards[peer] = card;
-      } catch (e) { errors.push(`card:${peer}:${e.message}`); }
-    }
-    if (cardParts.length > 0) {
-      parts['peer-card'] = cardParts.join('\n\n');
-    }
-
-    // Representations (POST, may take a few seconds) — with semantic dedup + P2 filtering
-    const reprParts = [];
-    for (const peer of [cfg.userPeer, cfg.agentPeer]) {
-      try {
-        const d = await honchoRequest('POST', `${base}/peers/${peer}/representation`, {}, cfg.reprTimeoutMs);
-        if (!d) { errors.push(`repr:${peer}:timeout`); continue; }
-        const rawText = typeof d === 'string' ? d : (d.representation || '');
-        if (rawText && rawText.trim().length > 0) {
-          const trimmed = _trimRepresentation(rawText, cfg.reprMaxObs, cards[peer]);
-          if (trimmed) {
-            // P2: filter out low-value content (medium/low patterns, premises, sources)
-            const filtered = _filterRepresentation(trimmed);
-            if (filtered) {
-              reprParts.push(`[Representation: ${peer}]\n${filtered}`);
-            }
-          }
-        }
-      } catch (e) { errors.push(`repr:${peer}:${e.message}`); }
-    }
-    if (reprParts.length > 0) {
-      parts['representation'] = reprParts.join('\n\n');
-    }
-
-    // Session context — P1: summary + semantic search (search_query = current
-    // user message) in one call. limit_to_session keeps it scoped to this
-    // directory's long-lived session.
-    try {
-      const params = new URLSearchParams({ summary: 'true', tokens: '500' });
-      if (searchQuery && searchQuery.trim().length > 0) {
-        params.set('search_query', searchQuery.trim().slice(0, 300));
-        params.set('search_top_k', '5');
-        params.set('search_max_distance', '0.85');
-        params.set('limit_to_session', 'true');
-      }
-      const d = await honchoRequest('GET',
-        `${base}/sessions/${honchoSid}/context?${params.toString()}`,
-        undefined, 8000
-      );
-      if (d) {
-        if (d.summary) parts['session-summary'] = `[Session Summary]\n${d.summary}`;
-        const searchResults = d.search_results || d.search || [];
-        if (Array.isArray(searchResults) && searchResults.length > 0) {
-          const lines = searchResults.slice(0, 5).map(r =>
-            `- ${(r.content || r.text || JSON.stringify(r)).slice(0, 300)}`
-          );
-          parts['semantic-recall'] = `[Semantic Recall (relevant to current question)]\n${lines.join('\n')}`;
-        }
-      }
-    } catch (e) { errors.push(`context:${e.message}`); }
-
-    const keys = Object.keys(parts);
-    if (keys.length === 0) return null;
-
-    // P2: assemble by priority (peer-card > session-summary > semantic-recall > representation)
-    const maxChars = cfg.injectionMaxChars || 4000;
-    const body = _assembleByPriority(parts, maxChars);
-
-    const note = errors.length > 0 ? `\n<!-- honcho-sync partial: ${errors.join('; ')} -->` : '';
-    return `<memory-context>\n${body}\n</memory-context>${note}`;
+  /** Shorten text to a budget without cutting a line in half. */
+  function _clampLines(text, max) {
+    if (!text || text.length <= max) return text;
+    const cut = text.slice(0, Math.max(0, max));
+    const newline = cut.lastIndexOf('\n');
+    const kept = newline > max * 0.5 ? cut.slice(0, newline) : cut;
+    return `${kept.trimEnd()}\n…[gekürzt]`;
   }
 
-  if (cfg.autoRecall && systemPrompt !== undefined) {
+  /**
+   * Build the peer-context path for one peer.
+   *
+   * HONCHO-SYNC API-FIX (2026-11-22): `GET /peers/{peer}/context` returns the
+   * peer card and a representation in one response, and `max_conclusions`
+   * bounds that representation server-side even without a search query
+   * (measured against v3.0.11: 17.268 -> 1.319 chars).
+   * @param peer - peer id to read.
+   * @param c - effective configuration.
+   * @param query - current user message; empty skips semantic curation.
+   * @returns the request path, relative to honchoUrl.
+   */
+  function _peerContextPath(peer, c, query) {
+    const params = new URLSearchParams();
+    const cap = peer === c.agentPeer ? c.maxConclusionsAgent : c.maxConclusionsUser;
+    params.set('max_conclusions', String(cap));
+    if (c.includeMostFrequent) params.set('include_most_frequent', 'true');
+    if (query) {
+      params.set('search_query', query.slice(0, 300));
+      params.set('search_top_k', String(c.searchTopK));
+      params.set('search_max_distance', String(c.searchMaxDistance));
+    }
+    return `/v3/workspaces/${c.workspace}/peers/${peer}/context?${params.toString()}`;
+  }
+
+  /**
+   * Fetch the memory block injected at session start.
+   * @param honchoSid - Honcho session name for this working directory.
+   * @param searchQuery - the user's current message, used to curate the representation.
+   * @returns the `<memory-context>` payload, or null when nothing could be fetched.
+   */
+  async function buildMemoryContext(honchoSid, searchQuery) {
+    const c = cfg();
+    const query = (searchQuery || '').trim();
+    const parts = {};
+    const failures = [];
+
+    // HONCHO-SYNC API-FIX (2026-11-22): one peer/context call per peer replaces
+    // the former /card + /representation pair, and the summary comes from the
+    // dedicated endpoint — /context only returns one above an undocumented
+    // token threshold (measured: null at tokens=500 and 2000, present at 3000),
+    // and it never returned the `search_results` field this code used to read.
+    const [userResult, agentResult, summaryResult] = await Promise.allSettled([
+      honchoRequest('GET', _peerContextPath(c.userPeer, c, query), undefined, c.reprTimeoutMs),
+      honchoRequest('GET', _peerContextPath(c.agentPeer, c, query), undefined, c.reprTimeoutMs),
+      honchoRequest('GET', `/v3/workspaces/${c.workspace}/sessions/${honchoSid}/summaries`, undefined, c.summaryTimeoutMs),
+    ]);
+
+    const peerParts = [];
+    for (const [peer, result] of [[c.userPeer, userResult], [c.agentPeer, agentResult]]) {
+      if (result.status !== 'fulfilled') {
+        failures.push(`peer-context:${peer}: ${result.reason?.message ?? result.reason}`);
+        continue;
+      }
+      const data = result.value ?? {};
+      const card = Array.isArray(data.peer_card)
+        ? data.peer_card.filter((fact) => typeof fact === 'string' && fact.trim().length > 0)
+        : [];
+      const representation = _filterRepresentation(
+        _trimRepresentation(data.representation || '', c.reprMaxObs, card),
+      );
+      const chunks = [];
+      if (card.length > 0) chunks.push(card.join('\n'));
+      if (representation) chunks.push(representation);
+      if (chunks.length > 0) peerParts.push(`[Peer: ${peer}]\n${chunks.join('\n\n')}`);
+    }
+    if (peerParts.length > 0) parts['peer-context'] = peerParts.join('\n\n');
+
+    if (summaryResult.status === 'fulfilled') {
+      const summaries = summaryResult.value ?? {};
+      // Short first: the long summary is ~15k chars and would crowd out recall.
+      const summaryText = String(summaries.short_summary?.content || summaries.long_summary?.content || '').trim();
+      if (summaryText) parts['session-summary'] = `[Session Summary]\n${_clampLines(summaryText, c.summaryMaxChars)}`;
+    } else {
+      failures.push(`summaries: ${summaryResult.reason?.message ?? summaryResult.reason}`);
+    }
+
+    if (Object.keys(parts).length === 0) {
+      _honchoLog('error', `memory injection for ${honchoSid} produced nothing: ${failures.join(' | ') || 'every endpoint returned empty data'}`);
+      return null;
+    }
+    if (failures.length > 0) {
+      _honchoLog('warn', `memory injection for ${honchoSid} is partial: ${failures.join(' | ')}`);
+    }
+    // Errors stay in the log; the injected text carries memory only.
+    return `<memory-context>\n${_assembleWithReserves(parts, c.injectionMaxChars || DEFAULTS.injectionMaxChars)}\n</memory-context>`;
+  }
+
+  if (cfg().autoRecall && systemPrompt !== undefined) {
     ctx.on('session/event', async (session, event) => {
       if (!session || !event) return;
       if (event.type !== 'user/message') return;
       const sessionId = session.id;
       if (!sessionId) return;
 
-      const s = state.get(sessionId);
-      if (s?.injected) return;
-      state.set(sessionId, { ...(s || {}), injected: true });
+      // HONCHO-SYNC INJECT-RETRY-FIX (2026-11-22): the old code marked the
+      // session as injected *before* awaiting, so a single failed fetch disabled
+      // memory for the rest of that session. The marker is now set only after a
+      // successful injection, and a failing session is retried a bounded number
+      // of times instead of silently giving up.
+      //
+      // HONCHO-SYNC INJECT-RACE-FIX (2026-11-22): moving that marker after the
+      // await opened a race — two events of the same session (a second turn, or a
+      // second agent on the same session) both passed the guard and both called
+      // systemPrompt.context(), which allows one registration per name and threw
+      // `prompt context "honcho:memory" is already registered`. An in-flight flag
+      // now admits exactly one attempt at a time.
+      const entry = state.get(sessionId) || {};
+      if (entry.injected || entry.inflight) return;
+      if ((entry.attempts || 0) >= cfg().injectionRetries) return;
+      state.set(sessionId, { ...entry, inflight: true });
 
       try {
         const snapshot = await sessionQuery.readSession(sessionId);
         const header = snapshot.session;
-        if (!header) return;
+        if (!header) {
+          state.set(sessionId, { ...entry, inflight: false });
+          return;
+        }
         const cwd = header.cwd || '';
         const honchoSid = honchoSessionId(cwd);
 
-        // P1: use the user's current message as the semantic search query so
-        // the injected recall is associative (brain-like), not just recency.
+        // Use the user's current message as the semantic query so the injected
+        // recall is associative rather than pure recency.
         const userMsgText = extractText(event?.data?.content) || '';
         const text = await buildMemoryContext(honchoSid, userMsgText);
-        if (text === null) return;
+        if (text === null) {
+          const attempts = (entry.attempts || 0) + 1;
+          state.set(sessionId, { ...entry, inflight: false, attempts });
+          _honchoLog('warn', `memory injection for ${honchoSid} failed (attempt ${attempts}/${cfg().injectionRetries}); retrying on the next turn`);
+          return;
+        }
 
-        const dispose = systemPrompt.context({
-          name: 'honcho:memory',
-          order: 120,
-          text,
-        });
+        // Release our own previous registration before adding the new text; the
+        // service keeps at most one entry per name in this scope.
+        const previous = state.get(sessionId)?.injectDispose;
+        if (typeof previous === 'function') {
+          try { previous(); } catch (e) {
+            _honchoLog('warn', `could not dispose the previous memory context for ${honchoSid}: ${e?.message ?? e}`);
+          }
+        }
+        let dispose;
+        try {
+          dispose = systemPrompt.context({
+            name: 'honcho:memory',
+            order: 120,
+            text,
+          });
+        } catch (e) {
+          // Someone else already owns the name in this scope: the memory is
+          // present either way, so this is a success, not a retryable failure.
+          if (String(e?.message ?? e).includes('already registered')) {
+            state.set(sessionId, { ...entry, inflight: false, injected: true });
+            _honchoLog('info', `memory context for ${honchoSid} is already registered; keeping the existing entry`);
+            return;
+          }
+          throw e;
+        }
 
         // Re-check: if the session died while we were fetching, drop it.
         const sessionsService = ctx.get('sessions');
         const stillThere = sessionsService ? sessionsService.get(sessionId) : undefined;
         if (stillThere === undefined) {
           dispose();
+          state.set(sessionId, { ...entry, inflight: false });
           return;
         }
 
-        state.set(sessionId, { ...state.get(sessionId), injectDispose: dispose });
-        console.log(`[honcho-sync] injected memory context for ${honchoSid} (${text.length} chars)`);
+        state.set(sessionId, { ...entry, inflight: false, injected: true, injectDispose: dispose });
+        _honchoLog('info', `injected memory context for ${honchoSid} (${text.length} chars)`);
       } catch (e) {
-        console.error(`[honcho-sync] inject error:`, e.message);
+        const attempts = (entry.attempts || 0) + 1;
+        state.set(sessionId, { ...entry, inflight: false, attempts });
+        _honchoLog('error', `memory injection failed for session ${sessionId} (attempt ${attempts}/${cfg().injectionRetries}): ${e?.message ?? e}`);
       }
     });
   }
@@ -1294,78 +1624,68 @@ function apply(ctx, config) {
   // ─── Auto-sync with persistence ────────────────────────────────────────
 
   async function postToHoncho(sessionId, messages) {
-    try {
-      const resp = await fetch(
-        `${cfg.honchoUrl}/v3/workspaces/${cfg.workspace}/sessions/${sessionId}/messages`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages }),
-        }
-      );
-      if (resp.ok || resp.status === 201) {
-        console.log(`[honcho-sync] synced to ${sessionId} (${messages.length} messages)`);
-      } else {
-        const text = await resp.text().catch(() => '');
-        console.error(`[honcho-sync] POST ${resp.status}: ${text.slice(0, 200)}`);
-      }
-    } catch (e) {
-      console.error(`[honcho-sync] fetch error:`, e.message);
+    const url = `${cfg().honchoUrl}/v3/workspaces/${cfg().workspace}/sessions/${sessionId}/messages`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    });
+    if (!resp.ok && resp.status !== 201) {
+      const text = await resp.text().catch(() => '');
+      // A rejected upload must not look like a sync: the caller keeps the cursor
+      // unchanged so the batch is retried instead of silently dropped.
+      throw new Error(`Honcho POST ${url} -> ${resp.status} ${resp.statusText} ${text.slice(0, 200)}`.trim());
     }
   }
 
   async function syncSession(sessionId) {
-    try {
-      if (!sessionQuery) return;
-      const snapshot = await sessionQuery.readSession(sessionId);
-      const header = snapshot.session;
-      const events = snapshot.events || [];
+    if (!sessionQuery) return;
+    const snapshot = await sessionQuery.readSession(sessionId);
+    const header = snapshot.session;
+    const events = snapshot.events || [];
 
-      if (!header || events.length === 0) return;
+    if (!header || events.length === 0) return;
 
-      const cwd = header.cwd || '';
-      const honchoSid = honchoSessionId(cwd);
+    const cwd = header.cwd || '';
+    const honchoSid = honchoSessionId(cwd);
 
-      // Get sync state from persistent file (survives restart)
-      const persisted = loadState();
-      const s = persisted[honchoSid] || { lastSyncedEventCount: 0 };
-      const lastCount = s.lastSyncedEventCount || 0;
+    // Get sync state from persistent file (survives restart)
+    const persisted = loadState();
+    const s = persisted[honchoSid] || { lastSyncedEventCount: 0 };
+    const lastCount = s.lastSyncedEventCount || 0;
 
-      if (events.length <= lastCount) return;
+    if (events.length <= lastCount) return;
 
-      // Build messages from ALL new events since last sync
-      const newEvents = events.slice(lastCount);
-      const messages = [];
+    // Build messages from ALL new events since last sync
+    const newEvents = events.slice(lastCount);
+    const messages = [];
 
-      for (const ev of newEvents) {
-        if (!ev || !ev.data) continue;
-        if (ev.type === 'user/message') {
-          const text = extractText(ev.data.content);
-          if (text) {
-            messages.push({ role: 'user', content: text.slice(0, cfg.messageMaxChars), peer_id: cfg.userPeer });
-          }
-        } else if (ev.type === 'assistant/message') {
-          const msg = ev.data.message || ev.data;
-          const text = extractText(msg.content);
-          if (text) {
-            messages.push({ role: 'assistant', content: text.slice(0, cfg.messageMaxChars), peer_id: cfg.agentPeer });
-          }
+    for (const ev of newEvents) {
+      if (!ev || !ev.data) continue;
+      if (ev.type === 'user/message') {
+        const text = extractText(ev.data.content);
+        if (text) {
+          messages.push({ role: 'user', content: text.slice(0, cfg().messageMaxChars), peer_id: cfg().userPeer });
+        }
+      } else if (ev.type === 'assistant/message') {
+        const msg = ev.data.message || ev.data;
+        const text = extractText(msg.content);
+        if (text) {
+          messages.push({ role: 'assistant', content: text.slice(0, cfg().messageMaxChars), peer_id: cfg().agentPeer });
         }
       }
+    }
 
-      if (messages.length === 0) {
-        persisted[honchoSid] = { ...s, lastSyncedEventCount: events.length };
-        saveState(persisted);
-        return;
-      }
-
-      console.log(`[honcho-sync] posting ${messages.length} messages to ${honchoSid}`);
-      await postToHoncho(honchoSid, messages);
+    if (messages.length === 0) {
       persisted[honchoSid] = { ...s, lastSyncedEventCount: events.length };
       saveState(persisted);
-    } catch (e) {
-      console.error(`[honcho-sync] syncSession error:`, e.message);
+      return;
     }
+
+    await postToHoncho(honchoSid, messages);
+    _honchoLog('info', `synced ${messages.length} messages to ${honchoSid}`);
+    persisted[honchoSid] = { ...s, lastSyncedEventCount: events.length };
+    saveState(persisted);
   }
 
   function scheduleSync(sessionId) {
@@ -1373,12 +1693,13 @@ function apply(ctx, config) {
     if (s.timer) clearTimeout(s.timer);
     s.timer = setTimeout(() => {
       s.timer = null;
-      syncSession(sessionId);
-    }, cfg.debounceMs);
+      // A detached timer must not raise an unhandled rejection: report instead.
+      syncSession(sessionId).catch((e) => _honchoLog('error', `sync failed for session ${sessionId}: ${e?.message ?? e}`));
+    }, cfg().debounceMs);
     state.set(sessionId, s);
   }
 
-  if (cfg.autoSync) {
+  if (cfg().autoSync) {
     ctx.on('session/event', (session, event) => {
       if (!session || !event) return;
       if (event.type !== 'assistant/message' && event.type !== 'user/message') return;
@@ -1387,6 +1708,41 @@ function apply(ctx, config) {
       scheduleSync(sessionId);
     });
   }
+
+  // ─── Preflight ─────────────────────────────────────────────────────────
+
+  /**
+   * HONCHO-SYNC PREFLIGHT (2026-11-22): prove the endpoint is reachable before
+   * the first prompt needs it. A wrong host, a stopped container, or an
+   * unreachable Tailscale name used to surface as a warning on stdout at the
+   * first user message. apply() now rejects, the fiber is marked FAILED, DSH
+   * logs it and keeps running — and the reason names the exact URL.
+   * @throws when the health probe fails while `preflight` is enabled.
+   */
+  async function _preflight() {
+    const c = cfg();
+    if (!c.preflight) return;
+    const url = `${c.honchoUrl}/health`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), c.preflightTimeoutMs);
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      const body = await resp.json().catch(() => null);
+      if (body?.status !== 'ok') throw new Error(`unexpected body ${JSON.stringify(body).slice(0, 120)}`);
+      _honchoLog('info', `preflight ok: ${c.honchoUrl} workspace=${c.workspace} peers=${c.userPeer}/${c.agentPeer}`);
+    } catch (e) {
+      const reason = e?.name === 'AbortError' ? `timeout after ${c.preflightTimeoutMs}ms` : (e?.message ?? String(e));
+      throw new Error(
+        `honcho-sync: preflight failed for ${c.honchoUrl} (${reason}). `
+        + 'Fix honchoUrl or the Honcho server, or set preflight: false in the profile patch to start without memory.',
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  await _preflight();
 
   // Cleanup
   ctx.effect(() => {
@@ -1400,4 +1756,4 @@ function apply(ctx, config) {
   });
 }
 
-export { name, inject, apply };
+export { name, inject, apply, Config };
